@@ -1,0 +1,38 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#17233f"/>
+      <stop offset="0.55" stop-color="#114f6b"/>
+      <stop offset="1" stop-color="#15c2c8"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.32" cy="0.26" r="0.9">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="lens" x1="196" y1="196" x2="316" y2="316" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2ff0c0"/>
+      <stop offset="1" stop-color="#17a7c9"/>
+    </linearGradient>
+  </defs>
+
+  <!-- background -->
+  <rect width="512" height="512" rx="116" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="116" fill="url(#glow)"/>
+
+  <!-- house -->
+  <path d="M256 92 L408 214 V388 a24 24 0 0 1 -24 24 H128 a24 24 0 0 1 -24 -24 V214 Z"
+        fill="#ffffff" fill-opacity="0.10"
+        stroke="#ffffff" stroke-opacity="0.9" stroke-width="16"
+        stroke-linejoin="round"/>
+
+  <!-- camera lens -->
+  <circle cx="256" cy="300" r="74" fill="#0d1b2e" fill-opacity="0.55"/>
+  <circle cx="256" cy="300" r="74" fill="none" stroke="url(#lens)" stroke-width="16"/>
+  <circle cx="256" cy="300" r="40" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="12"/>
+  <circle cx="238" cy="282" r="12" fill="#ffffff" fill-opacity="0.95"/>
+
+  <!-- AI spark -->
+  <path d="M356 150 l10 26 26 10 -26 10 -10 26 -10 -26 -26 -10 26 -10 Z" fill="#7cf9d8"/>
+  <!-- SmartHome+ plus -->
+  <path d="M150 150 h30 M165 135 v30" stroke="#7cf9d8" stroke-width="12" stroke-linecap="round"/>
+</svg>

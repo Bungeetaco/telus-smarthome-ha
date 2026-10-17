@@ -1,0 +1,43 @@
+# Changelog
+
+All notable changes to this project are documented here. This project adheres
+to [Semantic Versioning](https://semver.org/). It is **pre-1.0** — expect
+breaking changes between minor versions until the API surface stabilizes.
+
+## [0.4.0] — 2026-10-17
+
+### Added
+- **AI Sensor** — surfaces the camera's on-board object classification
+  (Person / Vehicle / Animal / Package / Motion) as an entity, with
+  confidence, timestamp, and bounding-box attributes.
+- **Self-healing stream bridge** — the KVS→RTSP bridge now detects when the
+  camera drops a live session (≈10-minute cap) and auto-reconnects within a
+  few seconds, with a watchdog and a `/health` endpoint reporting per-session
+  state. No more manual reloads to recover video.
+- `hacs.json` — installable as a HACS custom repository.
+- Project branding — logo and app icon in [`brand/`](brand/).
+
+### Fixed
+- **Token refresh on 403.** TELUS returns `403 "explicit deny"` (not `401`)
+  for an expired token on several endpoints; the client now refreshes and
+  retries on both, so entities no longer go *Unavailable* every few minutes.
+
+## [0.3.0] — 2026-10-16
+
+### Added
+- **Live video** via a GStreamer `webrtcbin` → RTSP bridge (replacing an
+  earlier aiortc attempt that never received media). Publishes to MediaMTX for
+  Home Assistant and HomeKit.
+- Motion, connectivity, Wi-Fi signal, and device-temperature sensors.
+
+## [0.2.0] — 2026-10-16
+
+### Added
+- Headless email/password login (idpurl → credentials → token, with refresh).
+- Device discovery, camera entity, and control scaffolding (switch/light/lock).
+
+## [0.1.0] — 2026-10-16
+
+### Added
+- Initial reverse-engineering of the TELUS SmartHome+ Platform API and project
+  scaffolding.

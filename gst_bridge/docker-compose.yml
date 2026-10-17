@@ -1,0 +1,23 @@
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:1.9.3
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      MTX_PROTOCOLS: tcp
+
+  bridge:
+    build: .
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # Where the bridge PUBLISHES to MediaMTX (loopback on the same host).
+      RTSP_PUBLISH_BASE: rtsp://127.0.0.1:8554
+      # Where Home Assistant READS the stream from — must be this host's
+      # LAN IP, reachable from HA. Set LAN_IP in a .env file (see .env.example).
+      RTSP_READ_BASE: rtsp://${LAN_IP:-127.0.0.1}:8554
+      BRIDGE_PORT: "8787"
+      # Self-healing tuning (optional overrides):
+      # STREAM_STALE_SEC: "8"
+      # STARTUP_GRACE_SEC: "25"
+      # MAX_AUTO_RECONNECTS: "6"
