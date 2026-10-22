@@ -68,7 +68,7 @@ If you only want sensors and AI detections, you can skip the bridge. For live vi
 
 ### 1 — Integration (via HACS — recommended)
 
-[![Open in HACS](https://img.shields.io/badge/HACS-Add%20Custom%20Repo-41BDF5.svg)](https://hacs.xyz/docs/faq/custom_repositories/)
+[![Open in HACS](https://img.shields.io/badge/HACS-Add%20Custom%20Repo-41BDF5.svg)](https://github.com/akramercury/telus-smarthome-ha/)
 
 1. In Home Assistant: **HACS → ⋮ (top right) → Custom repositories**.
 2. Add this repository URL, category **Integration**, and click **Add**.
