@@ -4,6 +4,15 @@ All notable changes to this project are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/). It is **pre-1.0** — expect
 breaking changes between minor versions until the API surface stabilizes.
 
+## [0.4.1] — 2026-10-22
+
+### Changed
+- **Brand images now ship with the integration** at
+  `custom_components/telus_smarthome/brand/` (icon + logo). Home Assistant
+  2026.3+ serves these locally and they override the brands CDN, so the icon
+  shows on the device/integration card with no submission to
+  home-assistant/brands and no extra config.
+
 ## [0.4.0] — 2026-10-17
 
 ### Added

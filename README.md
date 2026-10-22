@@ -1,10 +1,10 @@
 <div align="center">
 
-<img src="brand/logo.png" alt="TELUS SmartHome+ for Home Assistant" width="680">
+<img src="custom_components/telus_smarthome/brand/logo.png" alt="TELUS SmartHome+ for Home Assistant" width="680">
 
 ### Bring your TELUS SmartHome+ cameras and devices into Home Assistant — live video, AI detections, sensors and all — without giving up the TELUS app.
 
-[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.4.1-blue.svg)](CHANGELOG.md)
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz/)
 [![Home Assistant](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-049cdb.svg)](https://www.home-assistant.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -68,7 +68,7 @@ If you only want sensors and AI detections, you can skip the bridge. For live vi
 
 ### 1 — Integration (via HACS — recommended)
 
-[![Open in HACS](https://img.shields.io/badge/HACS-Add%20Custom%20Repo-41BDF5.svg)](https://github.com/akramercury/telus-smarthome-ha/)
+[![Open in HACS](https://img.shields.io/badge/HACS-Add%20Custom%20Repo-41BDF5.svg)](https://hacs.xyz/docs/faq/custom_repositories/)
 
 1. In Home Assistant: **HACS → ⋮ (top right) → Custom repositories**.
 2. Add this repository URL, category **Integration**, and click **Add**.
@@ -128,20 +128,25 @@ curl -s http://<this-host-ip>:8787/health
 - **Camera black / "404" in HA stream logs:** the bridge isn't publishing — check `docker compose logs -f bridge` and the `/health` endpoint, and confirm the bridge URL and `LAN_IP` are correct.
 - **Stream drops every ~10 minutes:** that's the camera's session cap; the self-healing bridge (0.4.0) reconnects automatically — watch for `auto-reconnect` in the logs.
 
-## 🎨 The icon in Home Assistant
+## 🎨 Branding
 
-The logo lives in [`brand/`](brand/) (`icon.svg`, `icon.png`, `logo.png`). HACS
-shows it automatically. To replace the *"icon not available"* placeholder on the
-device card **inside Home Assistant core**, the icon has to be submitted to the
-[home-assistant/brands](https://github.com/home-assistant/brands) repo:
+The logo and icon ship **with the integration**, in
+[`custom_components/telus_smarthome/brand/`](custom_components/telus_smarthome/brand/):
 
 ```
-custom_integrations/telus_smarthome/icon.png   (256×256 and icon@2x.png 512×512)
-custom_integrations/telus_smarthome/logo.png
+custom_components/telus_smarthome/brand/
+├── icon.png      # 256×256
+├── icon@2x.png   # 512×512
+├── logo.png      # wide banner
+└── icon.svg      # vector source
 ```
 
-Open a PR there with the files from `brand/`. Until it's merged, the integration
-works fine — it just shows the generic placeholder.
+Since **Home Assistant 2026.3**, custom integrations serve their own brand
+images locally from this `brand/` folder — they override the brands CDN, so the
+icon shows on the device/integration card with **no submission to
+home-assistant/brands and no extra config**. Just install and restart.
+Supported filenames also include `dark_icon.png`, `dark_logo.png`, and the
+`@2x` variants.
 
 ## 🙏 Acknowledgements
 
