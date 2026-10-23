@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local env / secrets
+.env
+*.env
+!.env.example
+
+# Captured diagnostics (may contain household IDs, serials, temp AWS creds)
+telus_smarthome_dump.json
+telus_smarthome_livestream.json
+*.dump.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.bak

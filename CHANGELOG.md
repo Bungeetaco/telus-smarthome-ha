@@ -4,6 +4,17 @@ All notable changes to this project are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/). It is **pre-1.0** — expect
 breaking changes between minor versions until the API surface stabilizes.
 
+## [0.5.0] — 2026-10-23
+
+### Added
+- **Recorded clips in the Media browser.** TELUS cloud recordings now appear
+  under *Media -> TELUS SmartHome+ -> (camera)* with time, detection type and
+  thumbnail, and play via the clip's own HLS stream (no bridge, no extra camera
+  slot). Works on dashboards and can be cast to media players.
+- The first clip-list response is written to `/config/telus_smarthome_clips.json`
+  to help confirm field names across firmware/regions.
+- `tools/fetch_clips.py` — standalone script to list/download clips to MP4.
+
 ## [0.4.1] — 2026-10-22
 
 ### Changed

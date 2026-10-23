@@ -4,7 +4,7 @@
 
 ### Bring your TELUS SmartHome+ cameras and devices into Home Assistant — live video, AI detections, sensors and all — without giving up the TELUS app.
 
-[![Version](https://img.shields.io/badge/version-0.4.1-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.5.0-blue.svg)](CHANGELOG.md)
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz/)
 [![Home Assistant](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-049cdb.svg)](https://www.home-assistant.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -25,6 +25,7 @@ TELUS SmartHome+ is a closed, white-label platform with no public API. This proj
 - 🤖 **AI Sensor** — see *what* the camera detected: **Person · Vehicle · Animal · Package · Motion**, with confidence and bounding box.
 - 🏃 **Motion**, **connectivity**, **Wi-Fi signal**, and **device-temperature** sensors.
 - ♻️ **Self-healing stream** — the camera caps live sessions (~10 min); the bridge notices and reconnects on its own in seconds. No more reloading HA.
+- 🎞️ **Recorded clips** — browse and play your TELUS cloud recordings from HA's *Media* sidebar.
 - 🧩 **Multi-camera** — one bridge container serves every TELUS camera on your account automatically.
 - 🍏 **HomeKit-ready** — the RTSP stream works with HA's built-in HomeKit Bridge.
 
@@ -119,11 +120,19 @@ curl -s http://<this-host-ip>:8787/health
 - [ ] **On-demand streaming** — only hold the camera while HA is actively viewing, freeing it (and upload bandwidth) for the TELUS app and clip playback.
 - [ ] **Audio** in the HA stream.
 - [ ] **Real-time events via MQTT** — instant Person/Vehicle/Package alerts, matching the app's push notifications.
-- [ ] **Saved clips** — expose the camera's recorded clips (the `/video_interval` KVS bundles).
+- [x] **Saved clips** — in the Media browser (0.5.0). Download-to-MP4 via `tools/fetch_clips.py`.
 - [ ] Doorbell + siren + spotlight controls.
+
+## 🎞️ Recorded clips
+
+Open **Media** in the HA sidebar -> **TELUS SmartHome+** -> pick a camera. Clips
+are the same ones the TELUS app shows (retention depends on your TELUS plan).
+Pick one to play it, or use it in a dashboard Media Control / cast it to a
+speaker or TV. To save clips as MP4 files, see [`tools/fetch_clips.py`](tools/fetch_clips.py).
 
 ## 🩺 Troubleshooting
 
+- **Media browser shows no clips:** open `/config/telus_smarthome_clips.json` (written on first browse) and open an issue with its contents (remove anything private) so field names can be adjusted.
 - **All entities go *Unavailable* after a few minutes:** fixed in 0.4.0 (token now refreshes on 403). Make sure you're on the latest.
 - **Camera black / "404" in HA stream logs:** the bridge isn't publishing — check `docker compose logs -f bridge` and the `/health` endpoint, and confirm the bridge URL and `LAN_IP` are correct.
 - **Stream drops every ~10 minutes:** that's the camera's session cap; the self-healing bridge (0.4.0) reconnects automatically — watch for `auto-reconnect` in the logs.

@@ -1,15 +1,20 @@
 {
   "domain": "telus_smarthome",
   "name": "TELUS SmartHome+",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "documentation": "https://github.com/akramercury/telus-smarthome-ha",
   "issue_tracker": "https://github.com/akramercury/telus-smarthome-ha/issues",
-  "codeowners": ["@akramercury"],
+  "codeowners": [
+    "@akramercury"
+  ],
   "config_flow": true,
   "iot_class": "cloud_polling",
   "integration_type": "hub",
   "dependencies": [],
-  "after_dependencies": ["stream"],
+  "after_dependencies": [
+    "stream",
+    "media_source"
+  ],
   "requirements": [
     "aiohttp>=3.9.0"
   ]

@@ -29,6 +29,8 @@ from .const import (
     DEFAULT_AUTH_DOMAIN,
     PATH_ACR_REFRESH,
     PATH_ACR_TOKEN,
+    PATH_CLIP_STREAM,
+    PATH_CLIPS,
     PATH_DISCOVERY,
     PATH_DEVICE,
     PATH_DEVICES,
@@ -339,6 +341,32 @@ class TelusSmartHomeApi:
         )
 
     # ------------------------------------------------------------------ #
+    # Recorded clips (cloud recordings)
+    # ------------------------------------------------------------------ #
+    async def async_get_clips(
+        self, device_id: str | None = None, max_results: int = 50
+    ) -> tuple[list[dict[str, Any]], Any]:
+        """List recent recorded clips. Returns (clips, raw_response)."""
+        path = PATH_CLIPS.format(household_id=self.household_id)
+        path += f"&maxResults={max_results}"
+        if device_id:
+            path += f"&deviceId={device_id}"
+        raw = await self._request(
+            "GET", path, headers=self._base_headers(with_household=True)
+        )
+        return _clip_items(raw), raw
+
+    async def async_get_clip_stream_url(self, clip_id: str) -> str | None:
+        """Return a playable HLS URL for a recorded clip."""
+        path = PATH_CLIP_STREAM.format(
+            household_id=self.household_id, clip_id=clip_id
+        ) + "?protocol=HLS"
+        raw = await self._request(
+            "GET", path, headers=self._base_headers(with_household=True)
+        )
+        return _find_url(raw)
+
+    # ------------------------------------------------------------------ #
     # low-level request with one automatic unified-token refresh on 401
     # ------------------------------------------------------------------ #
     def _base_headers(
@@ -474,3 +502,33 @@ def _first_household_id(data: Any) -> str | None:
         elif isinstance(item, str):
             return item
     return None
+
+
+def _clip_items(data: Any) -> list[dict]:
+    """Unwrap a clip-list payload (shape-tolerant; shape is not yet confirmed)."""
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        for key in ("clips", "items", "results", "recordings", "events",
+                    "data", "body"):
+            val = data.get(key)
+            if isinstance(val, list):
+                return [x for x in val if isinstance(x, dict)]
+            if isinstance(val, dict):
+                nested = _clip_items(val)
+                if nested:
+                    return nested
+    return []
+
+
+def _find_url(data: Any) -> str | None:
+    """Find a stream URL anywhere in a response, preferring an .m3u8."""
+    import json as _j
+    import re
+
+    blob = _j.dumps(data)
+    m = re.search(r'https?://[^\s"\\\']+\.m3u8[^\s"\\\']*', blob)
+    if m:
+        return m.group(0)
+    m = re.search(r'https?://[^\s"\\\']+', blob)
+    return m.group(0) if m else None
