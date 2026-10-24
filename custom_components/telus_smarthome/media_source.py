@@ -27,7 +27,7 @@ from .entity import device_name_of, device_type_of
 _LOGGER = logging.getLogger(__name__)
 
 MAX_CLIPS = 50
-HLS_MIME = "application/vnd.apple.mpegurl"
+HLS_MIME = "application/x-mpegURL"
 
 
 async def async_get_media_source(hass: HomeAssistant) -> "TelusMediaSource":

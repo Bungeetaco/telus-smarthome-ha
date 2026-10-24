@@ -4,6 +4,12 @@ All notable changes to this project are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/). It is **pre-1.0** — expect
 breaking changes between minor versions until the API surface stabilizes.
 
+## [0.5.2] — 2026-10-24
+
+### Fixed
+- Clip playback: label the stream `application/x-mpegURL` so Home Assistant's
+  player uses its HLS support (browsers could not play it as `vnd.apple.mpegurl`).
+
 ## [0.5.1] — 2026-10-23
 
 ### Fixed
