@@ -106,26 +106,57 @@ def login(s: requests.Session, email: str, password: str) -> str:
     return access
 
 
+def _first_household_id(data):
+    """Same lookup the HA integration uses (profile, households[], bare list)."""
+    if not isinstance(data, (dict, list)):
+        return None
+    cands = []
+    if isinstance(data, list):
+        cands = data
+    else:
+        for key in ("households", "data", "body", "items", "results"):
+            val = data.get(key)
+            if isinstance(val, list):
+                cands = val
+                break
+            if isinstance(val, dict) and isinstance(val.get("households"), list):
+                cands = val["households"]
+                break
+    for item in cands:
+        if isinstance(item, dict):
+            hid = item.get("householdId") or item.get("id")
+            if hid:
+                return hid
+        elif isinstance(item, str):
+            return item
+    return None
+
+
 def resolve_household(s: requests.Session, access: str) -> str:
     auth = hdr(Authorization=f"Bearer {access}")
     r = s.get(HOST + MY_PROFILE, headers=auth, timeout=30)
     r.raise_for_status()
     data = r.json()
     dbg("my-profile", data)
-    root = data if "profile" in data else (data.get("data") or data.get("body") or data)
-    profile = root.get("profile") or {}
-    hid = profile.get("householdId")
-    pid = profile.get("profileId") or profile.get("id")
+    root = data
+    if isinstance(root, dict) and "profile" not in root:
+        root = root.get("data") or root.get("body") or root
+    profile = (root.get("profile") if isinstance(root, dict) else None) or {}
+    pid = profile.get("profileId") or profile.get("id") or profile.get("uuid")
+    hid = profile.get("householdId") or _first_household_id(root)
     if hid:
         return hid
-    # fallback: households endpoint
-    r = s.get(HOST + HOUSEHOLDS.format(pid=pid), headers=auth, timeout=30)
-    r.raise_for_status()
-    lst = r.json()
-    lst = lst if isinstance(lst, list) else (lst.get("data") or lst.get("body") or [])
-    if lst:
-        return lst[0].get("householdId") or lst[0].get("id")
-    raise SystemExit("could not resolve household id")
+    if pid:
+        r = s.get(HOST + HOUSEHOLDS.format(pid=pid), headers=auth, timeout=30)
+        r.raise_for_status()
+        hid = _first_household_id(r.json())
+        if hid:
+            return hid
+    keys = list(root) if isinstance(root, dict) else type(root).__name__
+    raise SystemExit(
+        f"could not resolve household id (profile keys: {keys}). "
+        "Re-run with --debug, or pass it directly with --household <id>."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -170,6 +201,9 @@ def _clip_time(c: dict):
 
 
 def _clip_event(c: dict):
+    kw = c.get("keywords")
+    if isinstance(kw, list) and kw:
+        return "+".join(str(k).title() for k in kw)
     for k in ("eventName", "eventType", "type", "label", "detectionType", "category"):
         if c.get(k):
             return str(c[k])
@@ -230,6 +264,7 @@ def main() -> int:
     global DEBUG
     ap = argparse.ArgumentParser(description="Fetch TELUS SmartHome+ recorded clips.")
     ap.add_argument("--device", help="limit to one camera deviceId (e.g. odc-XXXX)")
+    ap.add_argument("--household", help="household id (skips auto-detect)")
     ap.add_argument("--max", type=int, default=25, help="how many recent clips to list")
     ap.add_argument("--get", help="'latest' | 'all' | row number | a clipId")
     ap.add_argument("--out", default="telus_clips", help="output folder for downloads")
@@ -243,7 +278,7 @@ def main() -> int:
     s = requests.Session()
     print("Logging in...")
     access = login(s, email, password)
-    hid = resolve_household(s, access)
+    hid = args.household or resolve_household(s, access)
     print(f"Household: {hid}")
 
     clips = list_clips(s, access, hid, args.device, args.max)
@@ -253,12 +288,12 @@ def main() -> int:
         return 1
 
     print(f"\n{len(clips)} recent clip(s):\n")
-    print(f"{'#':>3}  {'time (UTC)':<20} {'event':<12} clipId")
+    print(f"{'#':>3}  {'time (UTC)':<20} {'event':<18} clipId")
     print("-" * 70)
     for i, c in enumerate(clips):
         t = _clip_time(c)
         tstr = t.strftime("%Y-%m-%d %H:%M:%S") if isinstance(t, datetime) else str(t or "")
-        print(f"{i:>3}  {tstr:<20} {_clip_event(c):<12} {_clip_id(c)}")
+        print(f"{i:>3}  {tstr:<20} {_clip_event(c):<18} {_clip_id(c)}")
 
     if not args.get:
         print("\nTo download: --get latest | --get all | --get <row#> | --get <clipId>")

@@ -58,10 +58,19 @@ def _clip_time(c: dict) -> datetime | None:
 
 
 def _clip_event(c: dict) -> str:
+    """Detection label(s). Real responses carry keywords: ["PERSON","MOTION"]."""
+    kw = c.get("keywords")
+    if isinstance(kw, list) and kw:
+        return " + ".join(str(k).replace("_", " ").title() for k in kw)
     for k in ("eventName", "eventType", "type", "label", "detectionType", "category"):
         if c.get(k):
             return str(c[k]).replace("_", " ").title()
     return "Clip"
+
+
+def _dur(c: dict) -> str:
+    d = c.get("duration")
+    return f" ({int(d)}s)" if isinstance(d, (int, float)) and d else ""
 
 
 def _clip_thumb(c: dict) -> str | None:
@@ -187,7 +196,7 @@ class TelusMediaSource(MediaSource):
                     identifier=f"{dev_id}/{cid}",
                     media_class=MediaClass.VIDEO,
                     media_content_type=HLS_MIME,
-                    title=f"{when} - {_clip_event(c)}",
+                    title=f"{when} - {_clip_event(c)}{_dur(c)}",
                     can_play=True,
                     can_expand=False,
                     thumbnail=_clip_thumb(c),

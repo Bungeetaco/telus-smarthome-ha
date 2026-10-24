@@ -4,6 +4,12 @@ All notable changes to this project are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/). It is **pre-1.0** — expect
 breaking changes between minor versions until the API surface stabilizes.
 
+## [0.5.1] — 2026-10-23
+
+### Fixed
+- Clip list now reads the detection type from the camera's `keywords`
+  (e.g. Person + Motion) and shows clip duration, matching the real TELUS response.
+
 ## [0.5.0] — 2026-10-23
 
 ### Added
