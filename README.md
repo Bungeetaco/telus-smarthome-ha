@@ -4,7 +4,7 @@
 
 ### Bring your TELUS SmartHome+ cameras and devices into Home Assistant — live video, AI detections, sensors and all — without giving up the TELUS app.
 
-[![Version](https://img.shields.io/badge/version-0.6.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.6.1-blue.svg)](CHANGELOG.md)
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz/)
 [![Home Assistant](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-049cdb.svg)](https://www.home-assistant.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -138,6 +138,8 @@ speaker or TV. To save clips as MP4 files, see [`tools/fetch_clips.py`](tools/fe
 - **Automatically:** *Settings -> Devices & Services -> TELUS SmartHome+ ->
   Configure* -> enable **Auto-save new recorded clips** and choose how many days
   to keep. Off by default; clips are typically 10-100 MB each.
+- **Choose where they go:** set **Save folder for clips** in Configure — e.g. a
+  mounted network share like `/media/nas/cameras`. Blank = `media/telus_clips`.
 - **From an automation:** call the service `telus_smarthome.download_clip`
   (optionally with `device_id` / `clip_id`; default is the newest clip).
 

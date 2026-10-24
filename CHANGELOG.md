@@ -4,6 +4,16 @@ All notable changes to this project are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/). It is **pre-1.0** — expect
 breaking changes between minor versions until the API surface stabilizes.
 
+## [0.6.1] — 2026-10-24
+
+### Added
+- **Save folder option** (Configure -> "Save folder for clips"). Point it at any
+  folder Home Assistant can write to — e.g. a mounted network share such as
+  `/media/nas/cameras` — for both auto-save and "Play & download". The path is
+  tested for write access when you save the option. The `download_clip` service
+  also accepts a `folder`.
+- More logging around clip saving (ffmpeg command/errors).
+
 ## [0.6.0] — 2026-10-24
 
 ### Added

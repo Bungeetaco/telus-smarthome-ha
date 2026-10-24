@@ -26,6 +26,7 @@ from .const import (
     CONF_PASSWORD,
     CONF_PROFILE_ID,
     CONF_REFRESH_TOKEN,
+    CONF_SAVE_FOLDER,
     CONF_USERNAME,
     DEFAULT_AUTH_DOMAIN,
     DEFAULT_KEEP_DAYS,
@@ -102,13 +103,21 @@ class TelusConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class TelusOptionsFlow(OptionsFlow):
-    """Let the user set/change the KVS bridge URL after setup."""
+    """Bridge URL + recorded-clip saving options."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
+        errors: dict[str, str] = {}
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            folder = (user_input.get(CONF_SAVE_FOLDER) or "").strip()
+            user_input[CONF_SAVE_FOLDER] = folder
+            if folder and not await self.hass.async_add_executor_job(
+                _can_write, folder
+            ):
+                errors[CONF_SAVE_FOLDER] = "cannot_write"
+            else:
+                return self.async_create_entry(title="", data=user_input)
 
         opts = self.config_entry.options
         current = opts.get(
@@ -116,6 +125,7 @@ class TelusOptionsFlow(OptionsFlow):
         )
         return self.async_show_form(
             step_id="init",
+            errors=errors,
             data_schema=vol.Schema(
                 {
                     vol.Optional(CONF_BRIDGE_URL, default=current or ""): str,
@@ -123,9 +133,27 @@ class TelusOptionsFlow(OptionsFlow):
                         CONF_AUTO_SAVE, default=opts.get(CONF_AUTO_SAVE, False)
                     ): bool,
                     vol.Optional(
+                        CONF_SAVE_FOLDER, default=opts.get(CONF_SAVE_FOLDER, "")
+                    ): str,
+                    vol.Optional(
                         CONF_KEEP_DAYS,
                         default=opts.get(CONF_KEEP_DAYS, DEFAULT_KEEP_DAYS),
                     ): vol.All(vol.Coerce(int), vol.Range(min=0, max=3650)),
                 }
             ),
         )
+
+
+def _can_write(folder: str) -> bool:
+    """True if we can create `folder` and write a file in it."""
+    import os
+
+    try:
+        os.makedirs(folder, exist_ok=True)
+        probe = os.path.join(folder, ".telus_write_test")
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False

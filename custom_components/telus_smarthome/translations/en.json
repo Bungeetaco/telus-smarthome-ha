@@ -49,9 +49,13 @@
         "data": {
           "bridge_url": "KVS bridge URL (e.g. http://192.168.20.10:8787)",
           "auto_save_clips": "Auto-save new recorded clips to HA media (uses disk space)",
-          "keep_days": "Delete saved clips older than this many days (0 = keep forever)"
+          "keep_days": "Delete saved clips older than this many days (0 = keep forever)",
+          "save_folder": "Save folder for clips (blank = HA media/telus_clips). E.g. /media/nas/cameras"
         }
       }
+    },
+    "error": {
+      "cannot_write": "Home Assistant can't write to that folder. Check the path and that the share is mounted."
     }
   },
   "services": {
@@ -66,6 +70,10 @@
         "clip_id": {
           "name": "Clip ID",
           "description": "Clip id; defaults to the newest clip."
+        },
+        "folder": {
+          "name": "Save folder",
+          "description": "Folder to save into (default: the folder set in options)."
         }
       }
     }

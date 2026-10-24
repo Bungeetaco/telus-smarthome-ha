@@ -18,3 +18,10 @@ download_clip:
       example: odc-40D95A456B30-1792778069
       selector:
         text:
+    folder:
+      name: Save folder
+      description: Folder to save into. Defaults to the folder set in the integration options.
+      required: false
+      example: /media/nas/cameras
+      selector:
+        text:

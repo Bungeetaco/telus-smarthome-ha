@@ -36,7 +36,16 @@ def _media_root(hass: HomeAssistant) -> str:
     return dirs.get("local") or hass.config.path("media")
 
 
-def clip_path(hass: HomeAssistant, device_id: str, clip: dict) -> str:
+def save_base(hass: HomeAssistant, folder: str | None) -> str:
+    """Folder clips are saved into: the configured folder, else <media>/telus_clips."""
+    if folder and folder.strip():
+        return folder.strip()
+    return os.path.join(_media_root(hass), SAVE_SUBDIR)
+
+
+def clip_path(
+    hass: HomeAssistant, device_id: str, clip: dict, folder: str | None = None
+) -> str:
     """Deterministic file path for a clip (so 'already saved' = file exists)."""
     from .media_source import _clip_event, _clip_id, _clip_time
 
@@ -45,7 +54,7 @@ def clip_path(hass: HomeAssistant, device_id: str, clip: dict) -> str:
     stamp = t.strftime("%Y%m%d_%H%M%S") if isinstance(t, datetime) else "clip"
     ev = _SAFE.sub("-", _clip_event(clip).lower()).strip("-") or "clip"
     name = f"{stamp}_{ev}_{_SAFE.sub('_', cid)}.mp4"
-    return os.path.join(_media_root(hass), SAVE_SUBDIR, _SAFE.sub("_", device_id), name)
+    return os.path.join(save_base(hass, folder), _SAFE.sub("_", device_id), name)
 
 
 def _ffmpeg_bin(hass: HomeAssistant) -> str | None:
@@ -57,7 +66,8 @@ def _ffmpeg_bin(hass: HomeAssistant) -> str | None:
 class ClipSaver:
     """Downloads clips; one at a time, never twice."""
 
-    def __init__(self, hass: HomeAssistant, api, coordinator) -> None:
+    def __init__(self, hass: HomeAssistant, api, coordinator, folder: str | None = None) -> None:
+        self.folder = folder or None
         self.hass = hass
         self.api = api
         self.coordinator = coordinator
@@ -76,14 +86,16 @@ class ClipSaver:
         clips, raw = await self.api.async_get_clips(device_id, max_results)
         return [c for c in clips if (c.get("deviceId") in (None, device_id))]
 
-    async def async_save(self, device_id: str, clip: dict) -> str:
+    async def async_save(
+        self, device_id: str, clip: dict, folder: str | None = None
+    ) -> str:
         """Ensure the clip exists on disk as MP4 and return its path."""
         from .media_source import _clip_id
 
         cid = _clip_id(clip)
         if not cid:
             raise ValueError("clip has no id")
-        path = clip_path(self.hass, device_id, clip)
+        path = clip_path(self.hass, device_id, clip, folder or self.folder)
         if await self.hass.async_add_executor_job(_nonempty, path):
             return path
         async with self._lock:
@@ -100,8 +112,10 @@ class ClipSaver:
                 os.makedirs, os.path.dirname(path), 0o755, True
             )
             tmp = path + ".part"
+            _LOGGER.info("Saving TELUS clip %s with %s -> %s", cid, ffmpeg, path)
             proc = await asyncio.create_subprocess_exec(
                 ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
                 "-i", url, "-c", "copy", "-bsf:a", "aac_adtstoasc",
                 "-movflags", "+faststart", "-f", "mp4", tmp,
                 stdout=asyncio.subprocess.DEVNULL,
@@ -122,7 +136,7 @@ class ClipSaver:
             return path
 
     async def async_find_and_save(
-        self, device_id: str, clip_id: str | None
+        self, device_id: str, clip_id: str | None, folder: str | None = None
     ) -> str:
         """Save a given clip id (or the newest clip) for a camera."""
         from .media_source import _clip_id, _clip_time
@@ -137,7 +151,7 @@ class ClipSaver:
                 raise ValueError("no clips available")
             floor = datetime.min.replace(tzinfo=timezone.utc)
             match = max(clips, key=lambda c: _clip_time(c) or floor)
-        return await self.async_save(device_id, match)
+        return await self.async_save(device_id, match, folder)
 
     async def async_sync(self, keep_days: int) -> None:
         """Auto-save recent new clips, then prune old files."""
@@ -151,7 +165,7 @@ class ClipSaver:
             for c in clips:
                 if str(c.get("status", "CAPTURED")).upper() != "CAPTURED":
                     continue
-                path = clip_path(self.hass, dev_id, c)
+                path = clip_path(self.hass, dev_id, c, self.folder)
                 if await self.hass.async_add_executor_job(_nonempty, path):
                     continue
                 if keep_days and _too_old(c, keep_days):
@@ -167,7 +181,7 @@ class ClipSaver:
             await self.hass.async_add_executor_job(self._prune, keep_days)
 
     def _prune(self, keep_days: int) -> None:
-        root = os.path.join(_media_root(self.hass), SAVE_SUBDIR)
+        root = save_base(self.hass, self.folder)
         cutoff = time.time() - keep_days * 86400
         for dirpath, _dirs, files in os.walk(root):
             for f in files:
@@ -226,6 +240,7 @@ class TelusClipView(HomeAssistantView):
         ]
         if not savers:
             return web.Response(status=404, text="TELUS SmartHome+ not set up")
+        _LOGGER.info("Clip request: %s / %s", device_id, clip_id)
         try:
             path = await savers[0].async_find_and_save(device_id, clip_id)
         except Exception as err:  # noqa: BLE001

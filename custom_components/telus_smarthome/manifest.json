@@ -1,7 +1,7 @@
 {
   "domain": "telus_smarthome",
   "name": "TELUS SmartHome+",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "documentation": "https://github.com/akramercury/telus-smarthome-ha",
   "issue_tracker": "https://github.com/akramercury/telus-smarthome-ha/issues",
   "codeowners": [

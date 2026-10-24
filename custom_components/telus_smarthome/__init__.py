@@ -20,6 +20,7 @@ from .const import (
     CONF_PASSWORD,
     CONF_PROFILE_ID,
     CONF_REFRESH_TOKEN,
+    CONF_SAVE_FOLDER,
     CONF_USERNAME,
     DEFAULT_AUTH_DOMAIN,
     DEFAULT_KEEP_DAYS,
@@ -76,7 +77,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     bridge_url = entry.options.get(
         CONF_BRIDGE_URL, entry.data.get(CONF_BRIDGE_URL)
     )
-    saver = ClipSaver(hass, api, coordinator)
+    saver = ClipSaver(
+        hass, api, coordinator, entry.options.get(CONF_SAVE_FOLDER) or None
+    )
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
         "api": api,
         "coordinator": coordinator,
@@ -133,7 +136,9 @@ def _register_clip_support(hass: HomeAssistant) -> None:
             if not cams:
                 raise ValueError("no TELUS camera found")
             device_id = next(iter(cams))
-        path = await saver.async_find_and_save(device_id, call.data.get("clip_id"))
+        path = await saver.async_find_and_save(
+            device_id, call.data.get("clip_id"), call.data.get("folder") or None
+        )
         return {"path": path}
 
     import voluptuous as vol
@@ -146,6 +151,7 @@ def _register_clip_support(hass: HomeAssistant) -> None:
             {
                 vol.Optional("device_id"): str,
                 vol.Optional("clip_id"): str,
+                vol.Optional("folder"): str,
             }
         ),
         supports_response=SupportsResponse.OPTIONAL,
