@@ -19,13 +19,16 @@ from .api import TelusApiError, TelusAuthError, TelusSmartHomeApi
 from .const import (
     CONF_ACCESS_TOKEN,
     CONF_AUTH_DOMAIN,
+    CONF_AUTO_SAVE,
     CONF_BRIDGE_URL,
     CONF_HOUSEHOLD_ID,
+    CONF_KEEP_DAYS,
     CONF_PASSWORD,
     CONF_PROFILE_ID,
     CONF_REFRESH_TOKEN,
     CONF_USERNAME,
     DEFAULT_AUTH_DOMAIN,
+    DEFAULT_KEEP_DAYS,
     DOMAIN,
 )
 
@@ -107,12 +110,22 @@ class TelusOptionsFlow(OptionsFlow):
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        current = self.config_entry.options.get(
+        opts = self.config_entry.options
+        current = opts.get(
             CONF_BRIDGE_URL, self.config_entry.data.get(CONF_BRIDGE_URL, "")
         )
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
-                {vol.Optional(CONF_BRIDGE_URL, default=current or ""): str}
+                {
+                    vol.Optional(CONF_BRIDGE_URL, default=current or ""): str,
+                    vol.Optional(
+                        CONF_AUTO_SAVE, default=opts.get(CONF_AUTO_SAVE, False)
+                    ): bool,
+                    vol.Optional(
+                        CONF_KEEP_DAYS,
+                        default=opts.get(CONF_KEEP_DAYS, DEFAULT_KEEP_DAYS),
+                    ): vol.All(vol.Coerce(int), vol.Range(min=0, max=3650)),
+                }
             ),
         )

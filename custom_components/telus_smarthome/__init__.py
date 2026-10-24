@@ -5,22 +5,27 @@ import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import TelusSmartHomeApi
 from .const import (
     CONF_ACCESS_TOKEN,
     CONF_AUTH_DOMAIN,
+    CONF_AUTO_SAVE,
     CONF_BRIDGE_URL,
     CONF_HOUSEHOLD_ID,
+    CONF_KEEP_DAYS,
     CONF_PASSWORD,
     CONF_PROFILE_ID,
     CONF_REFRESH_TOKEN,
     CONF_USERNAME,
     DEFAULT_AUTH_DOMAIN,
+    DEFAULT_KEEP_DAYS,
     DOMAIN,
 )
+from .clips import SYNC_INTERVAL, ClipSaver, TelusClipView
 from .coordinator import TelusCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -71,15 +76,80 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     bridge_url = entry.options.get(
         CONF_BRIDGE_URL, entry.data.get(CONF_BRIDGE_URL)
     )
+    saver = ClipSaver(hass, api, coordinator)
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
         "api": api,
         "coordinator": coordinator,
         "bridge_url": bridge_url,
+        "clip_saver": saver,
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    _register_clip_support(hass)
+
+    # Optional auto-save of new clips to /media/telus_clips.
+    if entry.options.get(CONF_AUTO_SAVE, False):
+        keep_days = int(entry.options.get(CONF_KEEP_DAYS, DEFAULT_KEEP_DAYS))
+
+        async def _auto_sync(_now=None) -> None:
+            try:
+                await saver.async_sync(keep_days)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Clip auto-save pass failed: %s", err)
+
+        entry.async_on_unload(
+            async_track_time_interval(hass, _auto_sync, SYNC_INTERVAL)
+        )
+        entry.async_create_background_task(
+            hass, _auto_sync(), "telus_smarthome_clip_autosave_first_pass"
+        )
+        _LOGGER.info(
+            "TELUS clip auto-save is ON (keep %s days)", keep_days or "forever"
+        )
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
+
+
+def _register_clip_support(hass: HomeAssistant) -> None:
+    """Register the MP4 download view and the download_clip service (once)."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    if domain_data.get("_clip_support"):
+        return
+    domain_data["_clip_support"] = True
+    hass.http.register_view(TelusClipView(hass))
+
+    async def _download_clip(call: ServiceCall) -> dict:
+        savers = [
+            v["clip_saver"]
+            for v in hass.data.get(DOMAIN, {}).values()
+            if isinstance(v, dict) and "clip_saver" in v
+        ]
+        if not savers:
+            raise ValueError("TELUS SmartHome+ is not set up")
+        saver = savers[0]
+        device_id = call.data.get("device_id")
+        if not device_id:
+            cams = saver.cameras()
+            if not cams:
+                raise ValueError("no TELUS camera found")
+            device_id = next(iter(cams))
+        path = await saver.async_find_and_save(device_id, call.data.get("clip_id"))
+        return {"path": path}
+
+    import voluptuous as vol
+
+    hass.services.async_register(
+        DOMAIN,
+        "download_clip",
+        _download_clip,
+        schema=vol.Schema(
+            {
+                vol.Optional("device_id"): str,
+                vol.Optional("clip_id"): str,
+            }
+        ),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

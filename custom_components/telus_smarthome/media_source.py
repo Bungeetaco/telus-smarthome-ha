@@ -117,9 +117,30 @@ class TelusMediaSource(MediaSource):
         return out
 
     # ------------------------------------------------------------------ #
+    # Identifier scheme:
+    #   ""                       root (cameras)
+    #   "<dev>"                  camera -> two folders
+    #   "<dev>|cloud"            clips, played by streaming from TELUS
+    #   "<dev>|dl"               clips, saved as MP4 in /media and played from there
+    #   "<dev>/<clip>"           a streamed clip
+    #   "dl/<dev>/<clip>"        a saved/downloadable clip
+    # ------------------------------------------------------------------ #
     async def async_resolve_media(self, item: MediaSourceItem) -> PlayMedia:
         store = self._store()
         ident = item.identifier or ""
+
+        if ident.startswith("dl/"):
+            try:
+                _, dev_id, clip_id = ident.split("/", 2)
+            except ValueError as err:
+                raise Unresolvable("Bad clip id") from err
+            from datetime import timedelta
+            from homeassistant.components.http.auth import async_sign_path
+
+            path = f"/api/telus_smarthome/clip/{dev_id}/{clip_id}.mp4"
+            signed = async_sign_path(self.hass, path, timedelta(hours=2))
+            return PlayMedia(signed, "video/mp4")
+
         if "/" not in ident:
             raise Unresolvable("Select a specific clip")
         clip_id = ident.split("/", 1)[1]
@@ -131,39 +152,48 @@ class TelusMediaSource(MediaSource):
             raise Unresolvable("TELUS returned no stream URL for this clip")
         return PlayMedia(url, HLS_MIME)
 
+    def _folder(self, ident: str, title: str, children=None) -> BrowseMediaSource:
+        return BrowseMediaSource(
+            domain=DOMAIN,
+            identifier=ident or None,
+            media_class=MediaClass.DIRECTORY,
+            media_content_type="",
+            title=title,
+            can_play=False,
+            can_expand=True,
+            children=children,
+            children_media_class=MediaClass.DIRECTORY,
+        )
+
     async def async_browse_media(self, item: MediaSourceItem) -> BrowseMediaSource:
         store = self._store()
         cameras = self._cameras(store)
         ident = item.identifier or ""
 
         if not ident:  # root: list cameras
-            children = [
-                BrowseMediaSource(
-                    domain=DOMAIN,
-                    identifier=dev_id,
-                    media_class=MediaClass.DIRECTORY,
-                    media_content_type="",
-                    title=name,
-                    can_play=False,
-                    can_expand=True,
-                )
-                for dev_id, name in cameras.items()
-            ]
-            return BrowseMediaSource(
-                domain=DOMAIN,
-                identifier=None,
-                media_class=MediaClass.DIRECTORY,
-                media_content_type="",
-                title=self.name,
-                can_play=False,
-                can_expand=True,
-                children=children,
-                children_media_class=MediaClass.DIRECTORY,
+            return self._folder(
+                "", self.name,
+                [self._folder(d, n) for d, n in cameras.items()],
             )
 
-        dev_id = ident.split("/", 1)[0]
+        mode = None
+        dev_id = ident
+        if "|" in ident:
+            dev_id, mode = ident.split("|", 1)
         if dev_id not in cameras:
             raise BrowseError(f"Unknown camera: {dev_id}")
+
+        if mode is None:  # camera: pick how to play
+            return self._folder(
+                dev_id, cameras[dev_id],
+                [
+                    self._folder(f"{dev_id}|cloud", "Play from cloud (stream)"),
+                    self._folder(
+                        f"{dev_id}|dl",
+                        "Play & download (saves MP4 to HA media)",
+                    ),
+                ],
+            )
 
         try:
             clips, raw = await store["api"].async_get_clips(dev_id, MAX_CLIPS)
@@ -184,6 +214,7 @@ class TelusMediaSource(MediaSource):
         rows.sort(key=lambda r: r[0] or datetime.min.replace(tzinfo=timezone.utc),
                   reverse=True)
 
+        download = mode == "dl"
         children = []
         for t, c, cid in rows:
             when = (
@@ -193,21 +224,22 @@ class TelusMediaSource(MediaSource):
             children.append(
                 BrowseMediaSource(
                     domain=DOMAIN,
-                    identifier=f"{dev_id}/{cid}",
+                    identifier=f"dl/{dev_id}/{cid}" if download else f"{dev_id}/{cid}",
                     media_class=MediaClass.VIDEO,
-                    media_content_type=HLS_MIME,
+                    media_content_type="video/mp4" if download else HLS_MIME,
                     title=f"{when} - {_clip_event(c)}{_dur(c)}",
                     can_play=True,
                     can_expand=False,
                     thumbnail=_clip_thumb(c),
                 )
             )
+        title = "Play & download" if download else "Play from cloud"
         return BrowseMediaSource(
             domain=DOMAIN,
-            identifier=dev_id,
+            identifier=ident,
             media_class=MediaClass.DIRECTORY,
             media_content_type="",
-            title=cameras[dev_id],
+            title=f"{cameras[dev_id]} - {title}",
             can_play=False,
             can_expand=True,
             children=children,

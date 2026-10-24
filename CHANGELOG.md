@@ -4,6 +4,20 @@ All notable changes to this project are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/). It is **pre-1.0** — expect
 breaking changes between minor versions until the API surface stabilizes.
 
+## [0.6.0] — 2026-10-24
+
+### Added
+- **Download clips.** Media browser camera folder now has two views:
+  *Play from cloud (stream)* and *Play & download* — the latter saves the clip
+  as an MP4 in `media/telus_clips` and plays it from there (seekable, and the
+  browser's Download button works).
+- **Auto-save** (off by default): Configure -> "Auto-save new recorded clips".
+  Checks every 5 minutes, saves new clips as MP4, and prunes files older than
+  the "keep days" setting (default 14, 0 = keep forever).
+- Service `telus_smarthome.download_clip` (optional `device_id`, `clip_id`;
+  defaults to the newest clip).
+- Saved clips also appear under *Media -> My media -> telus_clips*.
+
 ## [0.5.2] — 2026-10-24
 
 ### Fixed

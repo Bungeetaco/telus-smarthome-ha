@@ -45,9 +45,27 @@
     "step": {
       "init": {
         "title": "TELUS SmartHome+ options",
-        "description": "Set the KVS camera bridge URL to enable live video.",
+        "description": "Bridge URL enables live video. Auto-save keeps copies of new recorded clips in your Home Assistant media folder (media/telus_clips).",
         "data": {
-          "bridge_url": "KVS bridge URL (e.g. http://192.168.20.10:8787)"
+          "bridge_url": "KVS bridge URL (e.g. http://192.168.20.10:8787)",
+          "auto_save_clips": "Auto-save new recorded clips to HA media (uses disk space)",
+          "keep_days": "Delete saved clips older than this many days (0 = keep forever)"
+        }
+      }
+    }
+  },
+  "services": {
+    "download_clip": {
+      "name": "Download clip",
+      "description": "Save a TELUS recorded clip as MP4 in the HA media folder.",
+      "fields": {
+        "device_id": {
+          "name": "Camera device ID",
+          "description": "TELUS camera id, e.g. odc-40D95A456B30."
+        },
+        "clip_id": {
+          "name": "Clip ID",
+          "description": "Clip id; defaults to the newest clip."
         }
       }
     }

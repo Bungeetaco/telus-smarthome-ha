@@ -103,6 +103,9 @@ CONF_REFRESH_TOKEN = "refresh_token"          # platform refresh token
 CONF_PROFILE_ID = "profile_id"
 CONF_HOUSEHOLD_ID = "household_id"
 CONF_BRIDGE_URL = "bridge_url"                # KVS->RTSP bridge base URL
+CONF_AUTO_SAVE = "auto_save_clips"            # save new clips to /media
+CONF_KEEP_DAYS = "keep_days"                  # delete saved clips older than N days (0 = never)
+DEFAULT_KEEP_DAYS = 14
 
 # ---------------------------------------------------------------------------
 # Behaviour

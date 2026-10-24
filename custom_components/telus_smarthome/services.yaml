@@ -1,0 +1,20 @@
+download_clip:
+  name: Download clip
+  description: >-
+    Save a TELUS recorded clip as an MP4 in Home Assistant's media folder
+    (media/telus_clips). With no clip_id, saves the newest clip.
+  fields:
+    device_id:
+      name: Camera device ID
+      description: TELUS camera id (e.g. odc-40D95A456B30). Defaults to the first camera.
+      required: false
+      example: odc-40D95A456B30
+      selector:
+        text:
+    clip_id:
+      name: Clip ID
+      description: Clip id from the Media browser / clip list. Defaults to the newest clip.
+      required: false
+      example: odc-40D95A456B30-1792778069
+      selector:
+        text:

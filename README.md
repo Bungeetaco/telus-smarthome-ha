@@ -4,7 +4,7 @@
 
 ### Bring your TELUS SmartHome+ cameras and devices into Home Assistant — live video, AI detections, sensors and all — without giving up the TELUS app.
 
-[![Version](https://img.shields.io/badge/version-0.5.2-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.6.0-blue.svg)](CHANGELOG.md)
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz/)
 [![Home Assistant](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-049cdb.svg)](https://www.home-assistant.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -120,7 +120,7 @@ curl -s http://<this-host-ip>:8787/health
 - [ ] **On-demand streaming** — only hold the camera while HA is actively viewing, freeing it (and upload bandwidth) for the TELUS app and clip playback.
 - [ ] **Audio** in the HA stream.
 - [ ] **Real-time events via MQTT** — instant Person/Vehicle/Package alerts, matching the app's push notifications.
-- [x] **Saved clips** — in the Media browser (0.5.0). Download-to-MP4 via `tools/fetch_clips.py`.
+- [x] **Saved clips** — Media browser, download-to-MP4, and optional auto-save (0.6.0).
 - [ ] Doorbell + siren + spotlight controls.
 
 ## 🎞️ Recorded clips
@@ -129,6 +129,19 @@ Open **Media** in the HA sidebar -> **TELUS SmartHome+** -> pick a camera. Clips
 are the same ones the TELUS app shows (retention depends on your TELUS plan).
 Pick one to play it, or use it in a dashboard Media Control / cast it to a
 speaker or TV. To save clips as MP4 files, see [`tools/fetch_clips.py`](tools/fetch_clips.py).
+
+### Saving clips as MP4
+
+- **One at a time:** in the Media browser pick **Play & download** — the clip is
+  saved to `media/telus_clips/` and plays from your HA (use the player's ⋮ menu
+  to download it to your PC).
+- **Automatically:** *Settings -> Devices & Services -> TELUS SmartHome+ ->
+  Configure* -> enable **Auto-save new recorded clips** and choose how many days
+  to keep. Off by default; clips are typically 10-100 MB each.
+- **From an automation:** call the service `telus_smarthome.download_clip`
+  (optionally with `device_id` / `clip_id`; default is the newest clip).
+
+Requires `ffmpeg` on the HA host (included with Home Assistant OS/Container).
 
 ## 🩺 Troubleshooting
 
