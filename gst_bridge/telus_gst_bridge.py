@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import subprocess
 import threading
 import time
 import uuid
@@ -52,6 +53,19 @@ STREAM_STALE_SEC = float(os.environ.get("STREAM_STALE_SEC", "8"))    # no frames
 STARTUP_GRACE_SEC = float(os.environ.get("STARTUP_GRACE_SEC", "25"))  # handshake window
 WATCHDOG_INTERVAL_SEC = float(os.environ.get("WATCHDOG_INTERVAL_SEC", "3"))
 MAX_AUTO_RECONNECTS = int(os.environ.get("MAX_AUTO_RECONNECTS", "6"))  # before waiting for HA
+
+# Audio (Opus -> AAC). The video path is untouched by audio: audio rides a
+# separate pipe into the SAME ffmpeg and is fed continuously (silence when the
+# camera sends nothing) so it can never starve/stall video. If a session fails
+# to come up with audio, the bridge automatically retries WITHOUT audio, so
+# audio can never take video down. Set ENABLE_AUDIO=0 to turn it off entirely.
+ENABLE_AUDIO = os.environ.get("ENABLE_AUDIO", "1") not in ("0", "false", "no", "")
+AUDIO_FALLBACK_AFTER = int(os.environ.get("AUDIO_FALLBACK_AFTER", "2"))  # failed reconnects before dropping audio
+AUDIO_RATE = 48000
+AUDIO_CHANNELS = 2
+AUDIO_FRAME_SEC = 0.02
+AUDIO_FRAME_BYTES = int(AUDIO_RATE * AUDIO_FRAME_SEC) * AUDIO_CHANNELS * 2  # s16le
+AUDIO_MAX_BACKLOG_BYTES = AUDIO_FRAME_BYTES * 25  # ~0.5s; drop older audio beyond this
 
 
 # --------------------------------------------------------------------------- #
@@ -119,7 +133,15 @@ def get_ice_servers(c: dict, client_id: str) -> list[str]:
 # One GStreamer webrtcbin viewer session (runs in its own thread + GLib loop)
 # --------------------------------------------------------------------------- #
 class GstSession:
-    def __init__(self, device_id: str, cfg: dict, publish_url: str, read_url: str):
+    def __init__(self, device_id: str, cfg: dict, publish_url: str, read_url: str,
+                 audio: bool = False):
+        self.audio = audio                 # request + publish audio for this session
+        self.audio_active = False          # real camera audio is arriving
+        self.audio_bytes = 0
+        self._audio_buf = bytearray()
+        self._audio_lock = threading.Lock()
+        self._audio_w = None               # write end of ffmpeg's audio pipe
+        self._audio_stop = threading.Event()
         self.device_id = device_id
         self.cfg = cfg
         self.publish_url = publish_url
@@ -161,6 +183,7 @@ class GstSession:
                 self.ws.close()
         except Exception:
             pass
+        self._audio_stop.set()
         if self.ffmpeg:
             try:
                 self.ffmpeg.terminate()
@@ -196,6 +219,16 @@ class GstSession:
                 "add-transceiver",
                 GstWebRTC.WebRTCRTPTransceiverDirection.RECVONLY, caps_v,
             )
+
+            if self.audio:
+                caps_a = Gst.Caps.from_string(
+                    "application/x-rtp,media=audio,encoding-name=OPUS,payload=111,"
+                    "clock-rate=48000,encoding-params=(string)2"
+                )
+                self.webrtc.emit(
+                    "add-transceiver",
+                    GstWebRTC.WebRTCRTPTransceiverDirection.RECVONLY, caps_a,
+                )
 
             self.webrtc.connect("on-negotiation-needed", self._on_neg)
             self.webrtc.connect("on-ice-candidate", self._on_local_ice)
@@ -314,18 +347,38 @@ class GstSession:
         caps = pad.get_current_caps()
         name = caps.to_string() if caps else ""
         _LOG.info("[%s] pad-added: %s", self.device_id, name[:80])
+        if "audio" in name:
+            self._on_audio_pad(pad)
+            return
         if "video" not in name:
             return
-        import subprocess
 
-        # ffmpeg reads Annex-B H.264 from stdin, copies it to RTSP.
-        self.ffmpeg = subprocess.Popen(
-            ["ffmpeg", "-hide_banner", "-loglevel", "warning",
-             "-fflags", "+genpts", "-f", "h264", "-i", "pipe:0",
-             "-c:v", "copy", "-f", "rtsp", "-rtsp_transport", "tcp",
-             self.publish_url],
-            stdin=subprocess.PIPE,
-        )
+        # ffmpeg reads Annex-B H.264 from stdin, copies it to RTSP. With audio
+        # enabled it ALSO reads raw PCM from a second pipe and encodes AAC; the
+        # video arguments are identical to the video-only pipeline.
+        if self.audio:
+            ar, aw = os.pipe()
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
+                   "-fflags", "+genpts", "-thread_queue_size", "512",
+                   "-framerate", "30", "-f", "h264", "-i", "pipe:0",
+                   "-thread_queue_size", "512",
+                   "-f", "s16le", "-ar", str(AUDIO_RATE), "-ac", str(AUDIO_CHANNELS),
+                   "-i", f"pipe:{ar}",
+                   "-map", "0:v", "-map", "1:a",
+                   "-c:v", "copy", "-c:a", "aac", "-b:a", "64k",
+                   "-f", "rtsp", "-rtsp_transport", "tcp", self.publish_url]
+            self.ffmpeg = subprocess.Popen(cmd, stdin=subprocess.PIPE, pass_fds=(ar,))
+            os.close(ar)  # parent keeps only the write end
+            self._audio_w = os.fdopen(aw, "wb", buffering=0)
+            threading.Thread(target=self._audio_writer, daemon=True).start()
+        else:
+            self.ffmpeg = subprocess.Popen(
+                ["ffmpeg", "-hide_banner", "-loglevel", "warning",
+                 "-fflags", "+genpts", "-f", "h264", "-i", "pipe:0",
+                 "-c:v", "copy", "-f", "rtsp", "-rtsp_transport", "tcp",
+                 self.publish_url],
+                stdin=subprocess.PIPE,
+            )
         chain = Gst.parse_bin_from_description(
             "rtph264depay ! h264parse config-interval=1 ! "
             "video/x-h264,stream-format=byte-stream,alignment=au ! "
@@ -338,7 +391,74 @@ class GstSession:
         appsink = chain.get_by_name("out")
         appsink.connect("new-sample", self._on_sample)
         self.started = True
-        _LOG.info("[%s] publishing via ffmpeg -> %s", self.device_id, self.publish_url)
+        _LOG.info("[%s] publishing via ffmpeg (audio=%s) -> %s",
+                  self.device_id, self.audio, self.publish_url)
+
+    # ---- audio: Opus -> raw PCM -> (paced, never-starving) -> ffmpeg ----
+    def _on_audio_pad(self, pad):
+        if not self.audio:
+            return
+        try:
+            chain = Gst.parse_bin_from_description(
+                "rtpopusdepay ! opusdec ! audioconvert ! audioresample ! "
+                f"audio/x-raw,format=S16LE,rate={AUDIO_RATE},channels={AUDIO_CHANNELS},"
+                "layout=interleaved ! "
+                "appsink name=aout emit-signals=true sync=false max-buffers=50 drop=true",
+                True,
+            )
+            self.pipe.add(chain)
+            chain.sync_state_with_parent()
+            pad.link(chain.get_static_pad("sink"))
+            chain.get_by_name("aout").connect("new-sample", self._on_audio_sample)
+            _LOG.info("[%s] audio branch linked (Opus -> PCM)", self.device_id)
+        except Exception as err:  # noqa: BLE001
+            # Audio failure must never affect video: just carry on with silence.
+            _LOG.warning("[%s] audio branch failed (video unaffected): %s",
+                         self.device_id, err)
+
+    def _on_audio_sample(self, sink):
+        sample = sink.emit("pull-sample")
+        if sample:
+            buf = sample.get_buffer()
+            ok, mapinfo = buf.map(Gst.MapFlags.READ)
+            if ok:
+                with self._audio_lock:
+                    self._audio_buf += bytes(mapinfo.data)
+                    over = len(self._audio_buf) - AUDIO_MAX_BACKLOG_BYTES
+                    if over > 0:
+                        del self._audio_buf[:over]  # keep latency bounded
+                self.audio_bytes += mapinfo.size
+                self.audio_active = True
+                buf.unmap(mapinfo)
+        return Gst.FlowReturn.OK
+
+    def _audio_writer(self):
+        """Feed ffmpeg's audio pipe in real time, 20 ms at a time.
+
+        Real camera audio is used when available, silence otherwise, so
+        ffmpeg's audio input never starves (a starved input is what stalled
+        video last time). Runs in its own thread: if it blocks, only audio
+        waits -- the video callback is separate.
+        """
+        silence = bytes(AUDIO_FRAME_BYTES)
+        nxt = time.monotonic()
+        while not self._audio_stop.is_set():
+            with self._audio_lock:
+                if len(self._audio_buf) >= AUDIO_FRAME_BYTES:
+                    chunk = bytes(self._audio_buf[:AUDIO_FRAME_BYTES])
+                    del self._audio_buf[:AUDIO_FRAME_BYTES]
+                else:
+                    chunk = silence
+            try:
+                self._audio_w.write(chunk)
+            except Exception:
+                return  # ffmpeg gone / session stopping
+            nxt += AUDIO_FRAME_SEC
+            delay = nxt - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            elif delay < -0.5:
+                nxt = time.monotonic()  # fell behind; resync
 
     def _on_sample(self, sink):
         sample = sink.emit("pull-sample")
@@ -363,7 +483,13 @@ SESSIONS_LOCK = threading.Lock()
 
 
 def _spawn_session(device_id, cfg, pub, read_url, attempts=0) -> GstSession:
-    sess = GstSession(device_id, cfg, pub, read_url)
+    # Audio only on fresh/early sessions; after repeated failures fall back to
+    # video-only so audio can never keep video from coming up.
+    use_audio = ENABLE_AUDIO and attempts < AUDIO_FALLBACK_AFTER
+    if ENABLE_AUDIO and not use_audio:
+        _LOG.info("[%s] audio disabled for this attempt (fallback to video-only)",
+                  device_id)
+    sess = GstSession(device_id, cfg, pub, read_url, audio=use_audio)
     sess.reconnect_attempts = attempts
     SESSIONS[device_id] = sess
     sess.start()
@@ -462,6 +588,9 @@ async def handle_health(request: web.Request) -> web.Response:
             "secs_since_frame": round(time.time() - s.last_sample_ts, 1)
             if s.last_sample_ts else None,
             "reconnect_attempts": s.reconnect_attempts,
+            "audio_requested": s.audio,
+            "audio_active": s.audio_active,
+            "audio_bytes": s.audio_bytes,
         }
         for dev, s in list(SESSIONS.items())
     }

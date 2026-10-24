@@ -4,6 +4,21 @@ All notable changes to this project are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/). It is **pre-1.0** — expect
 breaking changes between minor versions until the API surface stabilizes.
 
+## [0.7.0] — 2026-10-24
+
+### Added
+- **Audio in the live stream.** The bridge now negotiates the camera's Opus audio
+  and publishes it as AAC alongside the video (video is still copied, not
+  re-encoded). Audio rides a separate pipe that is fed continuously (silence
+  when the camera sends none), so it cannot stall video. If a session fails to
+  come up with audio, the bridge automatically retries video-only. Turn it off
+  with `ENABLE_AUDIO=0`.
+- `/health` reports `audio_requested`, `audio_active` and `audio_bytes`.
+- **Container limits** in `docker-compose.yml`: memory cap (bridge 768 MB,
+  MediaMTX 256 MB, no swap), CPU and process limits, log rotation, `init: true`,
+  and a healthcheck — so a leak or runaway process is capped and restarted
+  instead of growing without bound.
+
 ## [0.6.1] — 2026-10-24
 
 ### Added

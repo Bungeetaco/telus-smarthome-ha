@@ -4,7 +4,7 @@
 
 ### Bring your TELUS SmartHome+ cameras and devices into Home Assistant — live video, AI detections, sensors and all — without giving up the TELUS app.
 
-[![Version](https://img.shields.io/badge/version-0.6.1-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.7.0-blue.svg)](CHANGELOG.md)
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz/)
 [![Home Assistant](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-049cdb.svg)](https://www.home-assistant.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -21,6 +21,7 @@ TELUS SmartHome+ is a closed, white-label platform with no public API. This proj
 ## ✨ Features
 
 - 🔐 **Headless login** with your SmartHome+ email + password — no tokens to copy, auto-refreshes itself.
+- 🔊 **Audio** with the live stream (can be switched off).
 - 📹 **Live camera video** in Home Assistant (and on to Apple HomeKit / Apple TV via HA's HomeKit Bridge).
 - 🤖 **AI Sensor** — see *what* the camera detected: **Person · Vehicle · Animal · Package · Motion**, with confidence and bounding box.
 - 🏃 **Motion**, **connectivity**, **Wi-Fi signal**, and **device-temperature** sensors.
@@ -96,6 +97,10 @@ docker compose up -d --build
 
 Then in HA: **Settings → Devices & Services → TELUS SmartHome+ → Configure**, and set the **bridge URL** to `http://<this-host-ip>:8787`.
 
+The compose file caps memory/CPU/processes and rotates logs, so a misbehaving
+container is restarted instead of growing. Audio is on by default; set
+`ENABLE_AUDIO=0` in `.env` for video-only.
+
 Check it's healthy any time:
 
 ```bash
@@ -118,7 +123,7 @@ curl -s http://<this-host-ip>:8787/health
 ## 🗺️ Roadmap
 
 - [ ] **On-demand streaming** — only hold the camera while HA is actively viewing, freeing it (and upload bandwidth) for the TELUS app and clip playback.
-- [ ] **Audio** in the HA stream.
+- [x] **Audio** in the HA stream (0.7.0).
 - [ ] **Real-time events via MQTT** — instant Person/Vehicle/Package alerts, matching the app's push notifications.
 - [x] **Saved clips** — Media browser, download-to-MP4, and optional auto-save (0.6.0).
 - [ ] Doorbell + siren + spotlight controls.

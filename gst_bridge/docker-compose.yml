@@ -1,15 +1,30 @@
+# TELUS SmartHome+ stream bridge: MediaMTX (RTSP server) + the KVS->RTSP bridge.
+#
+# Resource limits are set on purpose: if anything misbehaves (e.g. a memory
+# leak) it is capped and auto-restarted instead of eating the host.
 services:
   mediamtx:
     image: bluenviron/mediamtx:1.9.3
     restart: unless-stopped
     network_mode: host
+    init: true
     environment:
       MTX_PROTOCOLS: tcp
+    mem_limit: 256m
+    memswap_limit: 256m        # no swap: hitting the limit => OOM-kill => restart
+    cpus: 1.0
+    pids_limit: 128
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
 
   bridge:
     build: .
     restart: unless-stopped
     network_mode: host
+    init: true                 # reaps the ffmpeg child processes cleanly
     environment:
       # Where the bridge PUBLISHES to MediaMTX (loopback on the same host).
       RTSP_PUBLISH_BASE: rtsp://127.0.0.1:8554
@@ -17,7 +32,21 @@ services:
       # LAN IP, reachable from HA. Set LAN_IP in a .env file (see .env.example).
       RTSP_READ_BASE: rtsp://${LAN_IP:-127.0.0.1}:8554
       BRIDGE_PORT: "8787"
+      # Audio (Opus -> AAC). Set to "0" to go back to video-only.
+      ENABLE_AUDIO: "${ENABLE_AUDIO:-1}"
       # Self-healing tuning (optional overrides):
       # STREAM_STALE_SEC: "8"
       # STARTUP_GRACE_SEC: "25"
       # MAX_AUTO_RECONNECTS: "6"
+    mem_limit: 768m            # hard cap (bridge + its ffmpeg children)
+    memswap_limit: 768m
+    cpus: 2.0
+    pids_limit: 256
+    logging: *logging
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
