@@ -61,6 +61,8 @@ MAX_AUTO_RECONNECTS = int(os.environ.get("MAX_AUTO_RECONNECTS", "6"))  # before 
 # audio can never take video down. Set ENABLE_AUDIO=0 to turn it off entirely.
 ENABLE_AUDIO = os.environ.get("ENABLE_AUDIO", "1") not in ("0", "false", "no", "")
 AUDIO_FALLBACK_AFTER = int(os.environ.get("AUDIO_FALLBACK_AFTER", "2"))  # failed reconnects before dropping audio
+# The camera's mic is quiet; boost it (dB) with a limiter so loud bangs don't clip.
+AUDIO_GAIN_DB = float(os.environ.get("AUDIO_GAIN_DB", "15"))
 AUDIO_RATE = 48000
 AUDIO_CHANNELS = 2
 AUDIO_FRAME_SEC = 0.02
@@ -365,7 +367,9 @@ class GstSession:
                    "-f", "s16le", "-ar", str(AUDIO_RATE), "-ac", str(AUDIO_CHANNELS),
                    "-i", f"pipe:{ar}",
                    "-map", "0:v", "-map", "1:a",
-                   "-c:v", "copy", "-c:a", "aac", "-b:a", "64k",
+                   "-c:v", "copy",
+                   "-filter:a", f"volume={AUDIO_GAIN_DB}dB,alimiter=limit=0.9:level=disabled",
+                   "-c:a", "aac", "-b:a", "64k",
                    "-f", "rtsp", "-rtsp_transport", "tcp", self.publish_url]
             self.ffmpeg = subprocess.Popen(cmd, stdin=subprocess.PIPE, pass_fds=(ar,))
             os.close(ar)  # parent keeps only the write end

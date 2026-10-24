@@ -4,7 +4,7 @@
 
 ### Bring your TELUS SmartHome+ cameras and devices into Home Assistant — live video, AI detections, sensors and all — without giving up the TELUS app.
 
-[![Version](https://img.shields.io/badge/version-0.7.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.7.1-blue.svg)](CHANGELOG.md)
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz/)
 [![Home Assistant](https://img.shields.io/badge/Home%20Assistant-2024.1%2B-049cdb.svg)](https://www.home-assistant.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -99,7 +99,9 @@ Then in HA: **Settings → Devices & Services → TELUS SmartHome+ → Configure
 
 The compose file caps memory/CPU/processes and rotates logs, so a misbehaving
 container is restarted instead of growing. Audio is on by default; set
-`ENABLE_AUDIO=0` in `.env` for video-only.
+`ENABLE_AUDIO=0` in `.env` for video-only. The camera mic is quiet, so
+`AUDIO_GAIN_DB` (default 15) boosts it; raise it to 25 if speech is still faint.
+**`LAN_IP` in `.env` must be set** or HA is told `127.0.0.1` and can't find the stream.
 
 Check it's healthy any time:
 

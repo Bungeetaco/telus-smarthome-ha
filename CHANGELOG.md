@@ -4,6 +4,17 @@ All notable changes to this project are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/). It is **pre-1.0** — expect
 breaking changes between minor versions until the API surface stabilizes.
 
+## [0.7.1] — 2026-10-24
+
+### Added
+- `AUDIO_GAIN_DB` (default 15): mic boost with a limiter. The camera's mic is
+  far-field and quiet; 15-25 dB makes speech clear without letting bangs clip.
+  Set in `.env`, then `docker compose up -d`.
+
+### Fixed (docs)
+- `LAN_IP` must be set in `.env` (the bridge hands HA `rtsp://<LAN_IP>:8554/...`);
+  with it unset HA is told `127.0.0.1` and cannot find the stream.
+
 ## [0.7.0] — 2026-10-24
 
 ### Added

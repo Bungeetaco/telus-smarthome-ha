@@ -34,6 +34,8 @@ services:
       BRIDGE_PORT: "8787"
       # Audio (Opus -> AAC). Set to "0" to go back to video-only.
       ENABLE_AUDIO: "${ENABLE_AUDIO:-1}"
+      # Mic boost in dB (camera mic is quiet). 0 = none. Try 10-25.
+      AUDIO_GAIN_DB: "${AUDIO_GAIN_DB:-15}"
       # Self-healing tuning (optional overrides):
       # STREAM_STALE_SEC: "8"
       # STARTUP_GRACE_SEC: "25"
