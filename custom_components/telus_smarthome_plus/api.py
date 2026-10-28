@@ -263,9 +263,29 @@ class TelusSmartHomeApi:
             PATH_DEVICE.format(household_id=self.household_id, device_id=device_id),
         )
 
-    async def async_refresh_status(self) -> None:
+    async def async_refresh_status(self, asset_id: str) -> None:
+        """Ask the backend to refresh a device's telemetry.
+
+        PlatformDeviceApi.refreshDeviceStatus takes assetId and householdId as
+        QUERY params with NO body (a JSON body returns HTTP 200 but returnCode
+        17100 "Missing householdId or assetId" -- a silent no-op, which is why
+        the old form never refreshed anything). assetId is the device id (the
+        camera's "db-..." asset id). The gateway expects the household + profile
+        headers the app sends.
+
+        Note: this REQUESTS a refresh. A mains camera updates its telemetry
+        promptly; a BATTERY device (e.g. this doorbell) only refreshes
+        wifi/temperature on its next wake, so those values can still lag the
+        call. The event resources (/aiSensor, /pirSensor) stay fresh regardless.
+        """
+        headers = self._base_headers(with_household=True)
+        if self.profile_id:
+            headers["x-unified-profile-id"] = self.profile_id
         await self._request(
-            "POST", PATH_REFRESH_STATUS, json={"householdId": self.household_id}
+            "POST",
+            PATH_REFRESH_STATUS,
+            params={"assetId": asset_id, "householdId": self.household_id or ""},
+            headers=headers,
         )
 
     async def async_send_command(
@@ -390,6 +410,7 @@ class TelusSmartHomeApi:
         path: str,
         *,
         json: Any | None = None,
+        params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         _auth: bool = True,
         _retry: bool = True,
@@ -403,7 +424,7 @@ class TelusSmartHomeApi:
         try:
             async with async_timeout.timeout(REQUEST_TIMEOUT):
                 async with self._session.request(
-                    method, url, json=json, headers=hdrs
+                    method, url, json=json, params=params, headers=hdrs
                 ) as resp:
                     text = await resp.text()
                     # TELUS returns 403 "explicit deny" (not 401) for an expired
@@ -429,13 +450,28 @@ class TelusSmartHomeApi:
                             method,
                             path,
                             json=json,
+                            params=params,
                             headers=retry_headers,
                             _auth=_auth,
                             _retry=False,
                         )
                     if resp.status >= 400:
                         raise TelusApiError(f"{method} {path} -> {resp.status}: {text}")
-                    return await _json(resp, text)
+                    data = await _json(resp, text)
+                    # Several endpoints (refreshDeviceStatus, send-commands, ...)
+                    # return HTTP 200 with a status envelope; a non-zero
+                    # returnCode means the call FAILED despite the 200 -- e.g.
+                    # the old json-body refreshDeviceStatus returned status 200
+                    # with returnCode 17100 "Missing householdId or assetId".
+                    # Surface it instead of silently succeeding.
+                    if isinstance(data, dict):
+                        rc = data.get("returnCode")
+                        if rc not in (None, 0, "0"):
+                            raise TelusApiError(
+                                f"{method} {path} -> returnCode {rc}: "
+                                f"{data.get('errorMessage') or data.get('message') or text}"
+                            )
+                    return data
         except aiohttp.ClientError as err:
             raise TelusApiError(f"network error on {method} {path}: {err}") from err
 

@@ -45,9 +45,10 @@ DEFAULT_AUTH_DOMAIN = "telus"
 # gateway key (using it returns 403 {"message":"Forbidden"}).
 PLATFORM_API_KEY = "TNUrbgYIhXjDvxDVmTsUcfoojeWfdhBd"
 
-# User-Agent the app presents (OkHttp). Some gateway/WAF rules reject requests
-# with no UA, so we send one.
-USER_AGENT = "okhttp/4.12.0"
+# User-Agent the app presents. TELUS fronts the API with Cloudflare/a WAF, so
+# send the exact app UA (confirmed from app 1.76.0) rather than a generic okhttp
+# string that a WAF rule can single out.
+USER_AGENT = "smarthomeplus/1.76.0 (com.telus.smarthome; build:198; Android 14)"
 
 # ---------------------------------------------------------------------------
 # Platform API paths (relative to PLATFORM_HOST)
@@ -114,6 +115,21 @@ DEFAULT_KEEP_DAYS = 14
 UPDATE_INTERVAL = timedelta(seconds=30)
 REQUEST_TIMEOUT = 30
 MANUFACTURER = "TELUS"
+
+# How often the coordinator asks the backend to pull LIVE telemetry from the
+# physical camera devices (POST refreshDeviceStatus). GET /devices otherwise
+# returns backend-CACHED resource values, so wifi signal, temperature and
+# connectivity freeze at their last app-triggered refresh. This POST pokes the
+# device's radio, so it runs once every REFRESH_STATUS_EVERY polls, NOT every
+# poll (6 * 30s = ~3 min).
+REFRESH_STATUS_EVERY = 6
+
+# The aiSensor resource reports value:true while detecting and carries an epoch
+# timestamp. The backend cache holds the last event's value:true until the next
+# refresh/clear, so the motion binary_sensor honours value:true only while its
+# timestamp is within this window; past it, motion is treated as cleared. This
+# is what stops the sensor latching ON indefinitely.
+MOTION_AUTO_OFF_SECONDS = 60
 
 # ---------------------------------------------------------------------------
 # Capability -> HA platform mapping. Capability identifiers come from the app's

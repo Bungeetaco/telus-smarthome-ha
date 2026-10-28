@@ -5,6 +5,8 @@ events (value true/false); connectivityStatus carries online state.
 """
 from __future__ import annotations
 
+import time
+
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
@@ -13,7 +15,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+from .const import DOMAIN, MOTION_AUTO_OFF_SECONDS
 from .entity import TelusEntity, get_resource, is_online, resources_of
 
 
@@ -41,10 +43,19 @@ class TelusMotion(TelusEntity, BinarySensorEntity):
 
     @property
     def is_on(self) -> bool | None:
+        now_ms = time.time() * 1000
         for href in ("/pirSensor", "/aiSensor"):
             res = get_resource(self.device, href)
-            if res and res.get("value") is True:
-                return True
+            if not res or res.get("value") is not True:
+                continue
+            # The backend cache holds the last event's value:true until the next
+            # refresh, so a value:true with a stale timestamp must not latch
+            # motion ON forever. Honour it only while the event is recent.
+            ts = res.get("timestamp")
+            if isinstance(ts, (int, float)) and ts > 0:
+                if (now_ms - ts) > MOTION_AUTO_OFF_SECONDS * 1000:
+                    continue
+            return True
         return False
 
 
