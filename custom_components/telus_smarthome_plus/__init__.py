@@ -104,7 +104,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             async_track_time_interval(hass, _auto_sync, SYNC_INTERVAL)
         )
         entry.async_create_background_task(
-            hass, _auto_sync(), "telus_smarthome_clip_autosave_first_pass"
+            hass, _auto_sync(), "telus_smarthome_plus_clip_autosave_first_pass"
         )
         _LOGGER.info(
             "TELUS clip auto-save is ON (keep %s days)", keep_days or "forever"
@@ -170,13 +170,13 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 
 async def _dump_devices(hass: HomeAssistant, api: TelusSmartHomeApi) -> None:
-    """Write the raw device-list JSON to /config/telus_smarthome_dump.json."""
+    """Write the raw device-list JSON to /config/telus_smarthome_plus_dump.json."""
     import json
 
     raw = getattr(api, "last_devices_raw", None)
     if raw is None:
         return
-    path = hass.config.path("telus_smarthome_dump.json")
+    path = hass.config.path("telus_smarthome_plus_dump.json")
 
     def _write() -> None:
         try:
@@ -203,7 +203,7 @@ async def _dump_livestream(hass: HomeAssistant, api, coordinator) -> None:
 
     from .entity import device_type_of
 
-    path = hass.config.path("telus_smarthome_livestream.json")
+    path = hass.config.path("telus_smarthome_plus_livestream.json")
     if await hass.async_add_executor_job(os.path.exists, path):
         return
 

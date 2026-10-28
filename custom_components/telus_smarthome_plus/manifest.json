@@ -1,5 +1,5 @@
 {
-  "domain": "telus_smarthome",
+  "domain": "telus_smarthome_plus",
   "name": "TELUS SmartHome+",
   "version": "0.7.1",
   "documentation": "https://github.com/akramercury/telus-smarthome-ha",

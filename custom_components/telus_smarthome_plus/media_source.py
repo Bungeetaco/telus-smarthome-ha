@@ -137,7 +137,7 @@ class TelusMediaSource(MediaSource):
             from datetime import timedelta
             from homeassistant.components.http.auth import async_sign_path
 
-            path = f"/api/telus_smarthome/clip/{dev_id}/{clip_id}.mp4"
+            path = f"/api/telus_smarthome_plus/clip/{dev_id}/{clip_id}.mp4"
             signed = async_sign_path(self.hass, path, timedelta(hours=2))
             return PlayMedia(signed, "video/mp4")
 
@@ -248,7 +248,7 @@ class TelusMediaSource(MediaSource):
 
     async def _dump_once(self, raw: Any) -> None:
         """Write the first raw clip-list response so field names can be checked."""
-        path = self.hass.config.path("telus_smarthome_clips.json")
+        path = self.hass.config.path("telus_smarthome_plus_clips.json")
 
         def _write() -> None:
             import os

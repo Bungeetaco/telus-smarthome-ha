@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-DOMAIN = "telus_smarthome"
+DOMAIN = "telus_smarthome_plus"
 
 # ---------------------------------------------------------------------------
 # Hosts (production)

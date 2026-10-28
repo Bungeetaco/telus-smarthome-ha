@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="custom_components/telus_smarthome/brand/logo.png" alt="TELUS SmartHome+ for Home Assistant" width="680">
+<img src="custom_components/telus_smarthome_plus/brand/logo.png" alt="TELUS SmartHome+ for Home Assistant" width="680">
 
 ### Bring your TELUS SmartHome+ cameras and devices into Home Assistant — live video, AI detections, sensors and all — without giving up the TELUS app.
 
@@ -46,7 +46,7 @@ The integration owns authentication and data. Live video needs a tiny helper bec
         ┌───────────────────────┐      ┌────────────────────────────┐
         │  HA Integration       │      │   gst_bridge (Docker)      │
         │  custom_components/    │ POST │  webrtcbin → RTSP          │
-        │  telus_smarthome       ├─────►│  + MediaMTX  + watchdog    │
+        │  telus_smarthome_plus       ├─────►│  + MediaMTX  + watchdog    │
         │  (login, entities,     │ /start      │                     │
         │   AI Sensor, camera)   │      └──────────────┬─────────────┘
         └───────────┬───────────┘                      │ RTSP
@@ -61,7 +61,7 @@ There are **two pieces** to install:
 
 | Piece | What it does | Required for |
 | --- | --- | --- |
-| `custom_components/telus_smarthome` | Login, devices, sensors, AI Sensor, camera entity | Everything |
+| `custom_components/telus_smarthome_plus` | Login, devices, sensors, AI Sensor, camera entity | Everything |
 | `gst_bridge/` (Docker) | KVS-WebRTC → RTSP converter | **Live video only** |
 
 If you only want sensors and AI detections, you can skip the bridge. For live video, run the bridge on any always-on Docker host on your LAN.
@@ -81,7 +81,7 @@ If you only want sensors and AI detections, you can skip the bridge. For live vi
 <details>
 <summary>Or install manually</summary>
 
-Copy `custom_components/telus_smarthome/` into your HA `config/custom_components/` folder and restart.
+Copy `custom_components/telus_smarthome_plus/` into your HA `config/custom_components/` folder and restart.
 </details>
 
 ### 2 — Streaming bridge (for live video)
@@ -147,14 +147,14 @@ speaker or TV. To save clips as MP4 files, see [`tools/fetch_clips.py`](tools/fe
   to keep. Off by default; clips are typically 10-100 MB each.
 - **Choose where they go:** set **Save folder for clips** in Configure — e.g. a
   mounted network share like `/media/nas/cameras`. Blank = `media/telus_clips`.
-- **From an automation:** call the service `telus_smarthome.download_clip`
+- **From an automation:** call the service `telus_smarthome_plus.download_clip`
   (optionally with `device_id` / `clip_id`; default is the newest clip).
 
 Requires `ffmpeg` on the HA host (included with Home Assistant OS/Container).
 
 ## 🩺 Troubleshooting
 
-- **Media browser shows no clips:** open `/config/telus_smarthome_clips.json` (written on first browse) and open an issue with its contents (remove anything private) so field names can be adjusted.
+- **Media browser shows no clips:** open `/config/telus_smarthome_plus_clips.json` (written on first browse) and open an issue with its contents (remove anything private) so field names can be adjusted.
 - **All entities go *Unavailable* after a few minutes:** fixed in 0.4.0 (token now refreshes on 403). Make sure you're on the latest.
 - **Camera black / "404" in HA stream logs:** the bridge isn't publishing — check `docker compose logs -f bridge` and the `/health` endpoint, and confirm the bridge URL and `LAN_IP` are correct.
 - **Stream drops every ~10 minutes:** that's the camera's session cap; the self-healing bridge (0.4.0) reconnects automatically — watch for `auto-reconnect` in the logs.
@@ -162,10 +162,10 @@ Requires `ffmpeg` on the HA host (included with Home Assistant OS/Container).
 ## 🎨 Branding
 
 The logo and icon ship **with the integration**, in
-[`custom_components/telus_smarthome/brand/`](custom_components/telus_smarthome/brand/):
+[`custom_components/telus_smarthome_plus/brand/`](custom_components/telus_smarthome_plus/brand/):
 
 ```
-custom_components/telus_smarthome/brand/
+custom_components/telus_smarthome_plus/brand/
 ├── icon.png      # 256×256
 ├── icon@2x.png   # 512×512
 ├── logo.png      # wide banner
