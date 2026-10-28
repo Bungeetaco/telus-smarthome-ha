@@ -263,9 +263,18 @@ class TelusSmartHomeApi:
             PATH_DEVICE.format(household_id=self.household_id, device_id=device_id),
         )
 
-    async def async_refresh_status(self) -> None:
+    async def async_refresh_status(self, asset_id: str) -> None:
+        """Ask the backend to pull LIVE telemetry from a device.
+
+        PlatformDeviceApi.refreshDeviceStatus takes assetId and householdId as
+        QUERY params with NO body; a JSON body is ignored and the call no-ops,
+        which is why GET /devices kept returning cached (frozen) wifi/temp/
+        connectivity values. assetId is the device id (the camera's "db-..." asset id).
+        """
         await self._request(
-            "POST", PATH_REFRESH_STATUS, json={"householdId": self.household_id}
+            "POST",
+            PATH_REFRESH_STATUS,
+            params={"assetId": asset_id, "householdId": self.household_id or ""},
         )
 
     async def async_send_command(
@@ -390,6 +399,7 @@ class TelusSmartHomeApi:
         path: str,
         *,
         json: Any | None = None,
+        params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         _auth: bool = True,
         _retry: bool = True,
@@ -403,7 +413,7 @@ class TelusSmartHomeApi:
         try:
             async with async_timeout.timeout(REQUEST_TIMEOUT):
                 async with self._session.request(
-                    method, url, json=json, headers=hdrs
+                    method, url, json=json, params=params, headers=hdrs
                 ) as resp:
                     text = await resp.text()
                     # TELUS returns 403 "explicit deny" (not 401) for an expired
@@ -429,6 +439,7 @@ class TelusSmartHomeApi:
                             method,
                             path,
                             json=json,
+                            params=params,
                             headers=retry_headers,
                             _auth=_auth,
                             _retry=False,
