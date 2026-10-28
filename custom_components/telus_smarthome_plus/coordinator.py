@@ -25,6 +25,7 @@ class TelusCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         )
         self.api = api
         self._poll_count = 0
+        self.video_settings: dict[str, list[Any]] = {}
 
     async def _async_update_data(self) -> dict[str, dict[str, Any]]:
         # Ask the backend to refresh camera telemetry. GET /devices returns
@@ -67,5 +68,23 @@ class TelusCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             dev_id = dev.get("deviceId") or dev.get("id") or dev.get("assetId")
             if dev_id:
                 indexed[str(dev_id)] = dev
+
+        # Per-type AI recording/notification toggles (video-event-settings) for
+        # camera devices, so the switch entities have state. Read-only GET, so
+        # fetching it every poll is fine. Keep the last value on a transient error.
+        from .entity import resources_of
+
+        video_settings: dict[str, list[Any]] = {}
+        for dev_id, dev in indexed.items():
+            if "/aiSensor" in {r.get("href") for r in resources_of(dev)}:
+                try:
+                    video_settings[dev_id] = await self.api.async_get_video_event_settings(
+                        dev_id
+                    )
+                except (TelusApiError, TelusAuthError) as err:
+                    _LOGGER.debug("video-event-settings(%s) failed: %s", dev_id, err)
+                    video_settings[dev_id] = self.video_settings.get(dev_id, [])
+        self.video_settings = video_settings
+
         _LOGGER.debug("Fetched %d devices", len(indexed))
         return indexed
