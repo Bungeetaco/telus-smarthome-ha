@@ -27,12 +27,14 @@ class TelusCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._poll_count = 0
 
     async def _async_update_data(self) -> dict[str, dict[str, Any]]:
-        # Keep live telemetry fresh. GET /devices returns backend-CACHED resource
-        # values; only POST refreshDeviceStatus makes the backend pull current
-        # wifi/temp/connectivity (and a cleared motion value) from the device. It
-        # pokes the physical device, so run it only every REFRESH_STATUS_EVERY
-        # polls, and only for camera devices (those exposing an /aiSensor or
-        # /pirSensor resource), never every battery device.
+        # Ask the backend to refresh camera telemetry. GET /devices returns
+        # backend-CACHED resource values; POST refreshDeviceStatus requests a
+        # fresh pull. It wakes/pokes the physical device, so run it only every
+        # REFRESH_STATUS_EVERY polls and only for camera devices (those exposing
+        # an /aiSensor or /pirSensor resource), never every battery device.
+        # NOTE: a battery camera (like the doorbell) only refreshes wifi/temp on
+        # its next wake, so this will not always un-freeze them immediately; the
+        # event resources (/aiSensor, /pirSensor) stay fresh regardless.
         if self.data and self._poll_count % REFRESH_STATUS_EVERY == 0:
             # Deferred import: entity.py imports this module, so importing it at
             # module top would be a circular import.
