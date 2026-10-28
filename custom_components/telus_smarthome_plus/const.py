@@ -93,6 +93,14 @@ PATH_CLIPS = "/video-management/clips/{household_id}?thumbnail=MOBILE"
 PATH_CLIP = "/video-management/clips/{household_id}/clip/{clip_id}?thumbnail=MOBILE"
 PATH_CLIP_STREAM = "/video-management/streaming/{household_id}/clip/{clip_id}"
 
+# Per-type AI recording/notification toggles (one GET/PUT; the app's FEBE host
+# does not resolve publicly, so the PLATFORM host is used). GET returns
+# {returnCode, body:{settingsGroups:[...]}}; PUT takes the settingsGroups array.
+PATH_VIDEO_EVENT_SETTINGS = (
+    "/presentation-management/profile/{profile_id}/household/{household_id}"
+    "/devices/{device_id}/video-event-settings"
+)
+
 # ---------------------------------------------------------------------------
 # Config-entry data keys
 # ---------------------------------------------------------------------------

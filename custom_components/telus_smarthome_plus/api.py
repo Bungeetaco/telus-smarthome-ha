@@ -42,6 +42,7 @@ from .const import (
     PATH_MY_PROFILE,
     PATH_REFRESH_STATUS,
     PATH_SEND_COMMANDS,
+    PATH_VIDEO_EVENT_SETTINGS,
     PLATFORM_API_KEY,
     PLATFORM_HOST,
     REQUEST_TIMEOUT,
@@ -286,6 +287,48 @@ class TelusSmartHomeApi:
             PATH_REFRESH_STATUS,
             params={"assetId": asset_id, "householdId": self.household_id or ""},
             headers=headers,
+        )
+
+    def _profile_scoped_headers(self) -> dict[str, str]:
+        headers = self._base_headers(with_household=True)
+        if self.profile_id:
+            headers["x-unified-profile-id"] = self.profile_id
+        return headers
+
+    async def async_get_video_event_settings(
+        self, device_id: str
+    ) -> list[dict[str, Any]]:
+        """GET a camera's per-type Detect/Notify recording toggles.
+
+        Returns the settingsGroups list (one group per detection type, each with
+        Detect and Notify settings). Empty list if the device has none.
+        """
+        data = await self._request(
+            "GET",
+            PATH_VIDEO_EVENT_SETTINGS.format(
+                profile_id=self.profile_id or "",
+                household_id=self.household_id or "",
+                device_id=device_id,
+            ),
+            headers=self._profile_scoped_headers(),
+        )
+        body = data.get("body") if isinstance(data, dict) else None
+        groups = body.get("settingsGroups") if isinstance(body, dict) else None
+        return groups if isinstance(groups, list) else []
+
+    async def async_set_video_event_settings(
+        self, device_id: str, settings_groups: list[dict[str, Any]]
+    ) -> None:
+        """PUT the full settingsGroups array back to change a toggle."""
+        await self._request(
+            "PUT",
+            PATH_VIDEO_EVENT_SETTINGS.format(
+                profile_id=self.profile_id or "",
+                household_id=self.household_id or "",
+                device_id=device_id,
+            ),
+            json=settings_groups,
+            headers=self._profile_scoped_headers(),
         )
 
     async def async_send_command(
