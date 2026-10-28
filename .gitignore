@@ -11,8 +11,8 @@ venv/
 !.env.example
 
 # Captured diagnostics (may contain household IDs, serials, temp AWS creds)
-telus_smarthome_dump.json
-telus_smarthome_livestream.json
+telus_smarthome_plus_dump.json
+telus_smarthome_plus_livestream.json
 *.dump.json
 
 # Editor / OS

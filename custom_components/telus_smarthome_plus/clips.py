@@ -1,6 +1,6 @@
 """Save TELUS recorded clips to Home Assistant's media folder as MP4.
 
-Used by: the `telus_smarthome.download_clip` service, the optional auto-save
+Used by: the `telus_smarthome_plus.download_clip` service, the optional auto-save
 (options), and the "Play & download" folder in the Media browser.
 Clips are remuxed (no re-encode) from TELUS's HLS stream with ffmpeg.
 """
@@ -219,14 +219,14 @@ def _rm(path: str) -> None:
 
 
 class TelusClipView(HomeAssistantView):
-    """GET /api/telus_smarthome/clip/{device_id}/{clip_id}.mp4 -> MP4 file.
+    """GET /api/telus_smarthome_plus/clip/{device_id}/{clip_id}.mp4 -> MP4 file.
 
     Saves the clip on first request (to /media/telus_clips) then serves it with
     range support, so it plays, seeks, and the browser's Download works.
     """
 
-    url = "/api/telus_smarthome/clip/{device_id}/{clip_id}.mp4"
-    name = "api:telus_smarthome:clip"
+    url = "/api/telus_smarthome_plus/clip/{device_id}/{clip_id}.mp4"
+    name = "api:telus_smarthome_plus:clip"
     requires_auth = True
 
     def __init__(self, hass: HomeAssistant) -> None:

@@ -50,7 +50,7 @@ breaking changes between minor versions until the API surface stabilizes.
 - **Auto-save** (off by default): Configure -> "Auto-save new recorded clips".
   Checks every 5 minutes, saves new clips as MP4, and prunes files older than
   the "keep days" setting (default 14, 0 = keep forever).
-- Service `telus_smarthome.download_clip` (optional `device_id`, `clip_id`;
+- Service `telus_smarthome_plus.download_clip` (optional `device_id`, `clip_id`;
   defaults to the newest clip).
 - Saved clips also appear under *Media -> My media -> telus_clips*.
 
@@ -73,7 +73,7 @@ breaking changes between minor versions until the API surface stabilizes.
   under *Media -> TELUS SmartHome+ -> (camera)* with time, detection type and
   thumbnail, and play via the clip's own HLS stream (no bridge, no extra camera
   slot). Works on dashboards and can be cast to media players.
-- The first clip-list response is written to `/config/telus_smarthome_clips.json`
+- The first clip-list response is written to `/config/telus_smarthome_plus_clips.json`
   to help confirm field names across firmware/regions.
 - `tools/fetch_clips.py` — standalone script to list/download clips to MP4.
 
@@ -81,7 +81,7 @@ breaking changes between minor versions until the API surface stabilizes.
 
 ### Changed
 - **Brand images now ship with the integration** at
-  `custom_components/telus_smarthome/brand/` (icon + logo). Home Assistant
+  `custom_components/telus_smarthome_plus/brand/` (icon + logo). Home Assistant
   2026.3+ serves these locally and they override the brands CDN, so the icon
   shows on the device/integration card with no submission to
   home-assistant/brands and no extra config.
