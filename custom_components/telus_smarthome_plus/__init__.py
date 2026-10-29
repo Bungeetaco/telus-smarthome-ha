@@ -39,6 +39,7 @@ PLATFORMS: list[Platform] = [
     Platform.SENSOR,
     Platform.BINARY_SENSOR,
     Platform.EVENT,
+    Platform.SELECT,
 ]
 
 
@@ -153,6 +154,47 @@ def _register_clip_support(hass: HomeAssistant) -> None:
                 vol.Optional("device_id"): str,
                 vol.Optional("clip_id"): str,
                 vol.Optional("folder"): str,
+            }
+        ),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
+    async def _send_command(call: ServiceCall) -> dict:
+        entries = [
+            v
+            for v in hass.data.get(DOMAIN, {}).values()
+            if isinstance(v, dict) and "api" in v
+        ]
+        if not entries:
+            raise ValueError("TELUS SmartHome+ is not set up")
+        data = entries[0]
+        api = data["api"]
+        coordinator = data["coordinator"]
+        device_id = call.data["device_id"]
+        dev = coordinator.data.get(device_id, {})
+        resp = await api.async_send_command(
+            device_id,
+            call.data["capability_identifier"],
+            call.data["operation"],
+            connector_id=call.data.get("connector_id") or dev.get("connectorId"),
+            group_id=call.data.get("group_id") or dev.get("groupId"),
+            provider=call.data.get("provider") or dev.get("provider"),
+        )
+        await coordinator.async_request_refresh()
+        return {"response": resp}
+
+    hass.services.async_register(
+        DOMAIN,
+        "send_command",
+        _send_command,
+        schema=vol.Schema(
+            {
+                vol.Required("device_id"): str,
+                vol.Required("capability_identifier"): str,
+                vol.Required("operation"): str,
+                vol.Optional("connector_id"): str,
+                vol.Optional("group_id"): str,
+                vol.Optional("provider"): str,
             }
         ),
         supports_response=SupportsResponse.OPTIONAL,

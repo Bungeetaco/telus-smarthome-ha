@@ -1,6 +1,7 @@
 """Switch platform (binary switch / smart plug)."""
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from homeassistant.components.switch import SwitchEntity
@@ -10,7 +11,19 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import CAP_BINARY_SWITCH, DOMAIN
-from .entity import TelusEntity, capability_ids, get_capability
+from .entity import (
+    TelusEntity,
+    capability_ids,
+    get_capability,
+    get_resource,
+    resources_of,
+)
+
+# Controllable binary-switch RESOURCES on cameras (href -> name, icon).
+BINARY_ACTUATORS: dict[str, tuple[str, str]] = {
+    "/siren": ("Siren", "mdi:alarm-light"),
+    "/hdr": ("HDR", "mdi:hdr"),
+}
 
 
 async def async_setup_entry(
@@ -23,6 +36,13 @@ async def async_setup_entry(
         # A device with brightness/color is a light, not a plain switch.
         if "binaryswitch" in caps and not (caps & {"brightness", "dimming"}):
             entities.append(TelusSwitch(coordinator, dev_id))
+        # Controllable binary-switch resources (camera siren / HDR).
+        hrefs = {r.get("href") for r in resources_of(dev)}
+        for href, (name, icon) in BINARY_ACTUATORS.items():
+            if href in hrefs:
+                entities.append(
+                    TelusResourceSwitch(coordinator, dev_id, href, name, icon)
+                )
 
     # AI recording/notification toggles (video-event-settings): one group per
     # detection type, each with a Detect and a Notify setting.
@@ -115,6 +135,37 @@ class TelusVideoEventToggle(TelusEntity, SwitchEntity):
             self._device_id, groups
         )
         await self.coordinator.async_request_refresh()
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self._set(True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self._set(False)
+
+
+class TelusResourceSwitch(TelusEntity, SwitchEntity):
+    """A controllable oic.r.switch.binary RESOURCE on a camera (siren, HDR).
+
+    A set is a send-commands WRITE to the resource href with operation
+    {"op":"w","cn":{"value":bool}} (the format confirmed against the app's
+    DeviceCommandConverters). Note: a camera only executes the command while its
+    control channel is reachable; a queued command may stay pending otherwise.
+    """
+
+    def __init__(self, coordinator, device_id: str, href: str, name: str, icon: str) -> None:
+        super().__init__(coordinator, device_id)
+        self._href = href
+        self._attr_name = name
+        self._attr_icon = icon
+        self._attr_unique_id = f"{device_id}_resource{href.replace('/', '_')}"
+
+    @property
+    def is_on(self) -> bool | None:
+        res = get_resource(self.device, self._href)
+        return bool(res.get("value")) if res else None
+
+    async def _set(self, value: bool) -> None:
+        await self._send(self._href, json.dumps({"op": "w", "cn": {"value": value}}))
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         await self._set(True)
