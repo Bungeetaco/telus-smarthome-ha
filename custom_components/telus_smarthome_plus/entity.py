@@ -131,7 +131,7 @@ class TelusEntity(CoordinatorEntity[TelusCoordinator]):
             self._device_id,
             capability,
             operation,
-            connector_id=dev.get("connectorId"),
+            connector_id=dev.get("connectorId") or metadata_of(dev).get("connectorId"),
             provider=dev.get("provider"),
         )
         await self.coordinator.async_request_refresh()

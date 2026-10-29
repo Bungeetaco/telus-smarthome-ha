@@ -25,3 +25,46 @@ download_clip:
       example: /media/nas/cameras
       selector:
         text:
+
+send_command:
+  name: Send device command
+  description: >-
+    Low-level: POST a single send-commands operation to a TELUS device
+    (capabilityIdentifier + operation). For actuators like the doorbell siren,
+    spotlight and HDR whose entities are not built yet, and for debugging.
+  fields:
+    device_id:
+      name: Device ID
+      description: TELUS device/asset id (e.g. db-...).
+      required: true
+      selector:
+        text:
+    capability_identifier:
+      name: Capability identifier
+      description: The capabilityIdentifier string (e.g. binarySwitch, hdr, siren, spotlight).
+      required: true
+      selector:
+        text:
+    operation:
+      name: Operation
+      description: The operation string (e.g. on, off, true, false, setMode:on).
+      required: true
+      selector:
+        text:
+    connector_id:
+      name: Connector ID
+      description: Override; defaults to the device's connectorId.
+      required: false
+      selector:
+        text:
+    group_id:
+      name: Group ID
+      required: false
+      selector:
+        text:
+    provider:
+      name: Provider
+      description: Override; defaults to the device's provider.
+      required: false
+      selector:
+        text:
