@@ -20,3 +20,4 @@ telus_smarthome_plus_livestream.json
 .idea/
 .vscode/
 *.bak
+gst_bridge/docker-compose.override.yml
