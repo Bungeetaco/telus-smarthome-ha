@@ -103,19 +103,36 @@ class TelusCamera(TelusEntity, Camera):
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
-        """Still image: fall back to the device's thumbnail URL if present."""
+        """Still image: the device's thumbnail URL when the API offers one, else a
+        frame from Home Assistant's bundled go2rtc, which already relays this
+        camera's stream. Returning None here made camera_proxy answer 500 on every
+        dashboard load (card poster, more-info preview, notification images)."""
         dev = self.device
         thumb = (
             dev.get("thumbnailUrl")
             or dev.get("snapshotUrl")
             or (dev.get("camera") or {}).get("thumbnailUrl")
         )
-        if not thumb:
-            return None
         session = async_get_clientsession(self.hass)
+        if thumb:
+            try:
+                async with async_timeout.timeout(15):
+                    async with session.get(thumb) as resp:
+                        if resp.status == 200:
+                            return await resp.read()
+            except (aiohttp.ClientError, TimeoutError):
+                pass
+        return await self._go2rtc_frame(session)
+
+    async def _go2rtc_frame(self, session: aiohttp.ClientSession) -> bytes | None:
+        """One JPEG frame of this entity's stream from HA's go2rtc (loopback, the
+        default bind of the core go2rtc integration), or None if it cannot."""
+        if not self.entity_id:
+            return None
+        url = f"http://127.0.0.1:1984/api/frame.jpeg?src={self.entity_id}"
         try:
-            async with async_timeout.timeout(15):
-                async with session.get(thumb) as resp:
+            async with async_timeout.timeout(8):
+                async with session.get(url) as resp:
                     if resp.status == 200:
                         return await resp.read()
         except (aiohttp.ClientError, TimeoutError):

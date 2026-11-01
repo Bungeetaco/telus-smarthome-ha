@@ -4,6 +4,18 @@ All notable changes to this project are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/). It is **pre-1.0** — expect
 breaking changes between minor versions until the API surface stabilizes.
 
+## [0.12.1]
+
+### Fixed
+- `camera_proxy` for a camera whose API device carries no `thumbnailUrl` answered
+  500 on every dashboard load (card poster, more-info preview, notification
+  images). `async_camera_image` now falls back to one frame from Home Assistant's
+  bundled go2rtc (`/api/frame.jpeg?src=<entity_id>` on loopback), which already
+  relays the camera's stream, and returns None only when that fails too.
+- The raw device-list dump (`telus_smarthome_plus_dump.json`) is written once,
+  like the live-stream dump, instead of being rewritten with a WARNING on every
+  start.
+
 ## [0.7.1] — 2026-10-24
 
 ### Added

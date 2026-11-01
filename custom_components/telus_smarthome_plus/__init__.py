@@ -220,6 +220,13 @@ async def _dump_devices(hass: HomeAssistant, api: TelusSmartHomeApi) -> None:
     if raw is None:
         return
     path = hass.config.path("telus_smarthome_plus_dump.json")
+    # one-time like _dump_livestream: once the file exists the setup is done and a
+    # WARNING on every restart is just noise (delete the file to re-dump)
+    import os
+
+    if await hass.async_add_executor_job(os.path.exists, path):
+        _LOGGER.debug("TELUS device dump already at %s; not rewriting", path)
+        return
 
     def _write() -> None:
         try:
@@ -229,8 +236,8 @@ async def _dump_devices(hass: HomeAssistant, api: TelusSmartHomeApi) -> None:
             _LOGGER.warning("Could not write device dump: %s", err)
 
     await hass.async_add_executor_job(_write)
-    _LOGGER.warning(
-        "TELUS device dump written to %s. Upload this file to finish camera setup.",
+    _LOGGER.info(
+        "TELUS device dump written to %s (first run only). Upload it to finish camera setup.",
         path,
     )
 
