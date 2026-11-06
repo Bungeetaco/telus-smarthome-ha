@@ -15,9 +15,12 @@ HTTP control API (unchanged from the aiortc version):
 """
 from __future__ import annotations
 
+import asyncio
 import base64
+import faulthandler
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -53,6 +56,9 @@ STREAM_STALE_SEC = float(os.environ.get("STREAM_STALE_SEC", "8"))    # no frames
 STARTUP_GRACE_SEC = float(os.environ.get("STARTUP_GRACE_SEC", "25"))  # handshake window
 WATCHDOG_INTERVAL_SEC = float(os.environ.get("WATCHDOG_INTERVAL_SEC", "3"))
 MAX_AUTO_RECONNECTS = int(os.environ.get("MAX_AUTO_RECONNECTS", "6"))  # before waiting for HA
+# How long a caller waits for a session's stop() before leaving it to finish in
+# the background. Tearing down a wedged webrtcbin can block indefinitely.
+STOP_TIMEOUT_SEC = float(os.environ.get("STOP_TIMEOUT_SEC", "5"))
 
 # Audio (Opus -> AAC). The video path is untouched by audio: audio rides a
 # separate pipe into the SAME ffmpeg and is fed continuously (silence when the
@@ -160,6 +166,7 @@ class GstSession:
         self.reconnect_attempts = 0        # auto-reconnects since last fresh /start
         self._ws_ready = False
         self._ws_queue = []
+        self._stopping = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def is_healthy(self) -> bool:
@@ -180,9 +187,20 @@ class GstSession:
         self._thread.start()
 
     def stop(self):
+        """Ask the session to shut down. Only quick, bounded calls happen here;
+        the GStreamer teardown runs on the session's own thread (see _run), so a
+        wedged webrtcbin can never hang the caller.
+
+        Why: 2026-11-04 22:23 UTC the watchdog restarted a stale doorbell
+        session and the bridge's HTTP loop never answered again (27 h of
+        /health timeouts, HA logging "Bridge unreachable" every minute). The
+        old stop() ran pipe.set_state(NULL) in the caller's thread, and HA's
+        next /start called it from inside the aiohttp event loop.
+        """
+        self._stopping.set()
         try:
             if self.ws:
-                self.ws.close()
+                self.ws.close(timeout=1)
         except Exception:
             pass
         self._audio_stop.set()
@@ -193,11 +211,25 @@ class GstSession:
                 pass
         if self.loop:
             self.loop.quit()
-        if self.pipe:
-            self.pipe.set_state(Gst.State.NULL)
+
+    def _teardown(self):
+        """Release the pipeline. Runs on the session thread only."""
+        pipe, self.pipe = self.pipe, None
+        if pipe is None:
+            return
+        try:
+            pipe.set_state(Gst.State.NULL)
+        except Exception as err:  # noqa: BLE001
+            _LOG.warning("[%s] pipeline teardown failed: %s", self.device_id, err)
 
     # ---- thread entry ----
     def _run(self):
+        try:
+            self._run_inner()
+        finally:
+            self._teardown()
+
+    def _run_inner(self):
         dev = self.device_id
         try:
             ice = get_ice_servers(self.cfg, self.client_id)
@@ -250,6 +282,8 @@ class GstSession:
             threading.Thread(target=self.ws.run_forever, daemon=True).start()
 
             self.loop = GLib.MainLoop()
+            if self._stopping.is_set():
+                return  # stop() raced the handshake; don't enter the loop
             self.loop.run()
         except Exception as err:  # noqa: BLE001
             _LOG.exception("[%s] session crashed: %s", dev, err)
@@ -486,6 +520,19 @@ SESSIONS: dict[str, GstSession] = {}
 SESSIONS_LOCK = threading.Lock()
 
 
+def _stop_session(sess: GstSession, timeout: float = STOP_TIMEOUT_SEC) -> None:
+    """Run sess.stop() on a helper thread and wait at most `timeout` seconds.
+    A stop still running afterwards finishes in the background (daemon thread)
+    instead of blocking the caller."""
+    t = threading.Thread(target=sess.stop, daemon=True,
+                         name=f"stop-{sess.device_id}")
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        _LOG.warning("[%s] stop() still running after %.0fs; continuing without it",
+                     sess.device_id, timeout)
+
+
 def _spawn_session(device_id, cfg, pub, read_url, attempts=0) -> GstSession:
     # Audio only on fresh/early sessions; after repeated failures fall back to
     # video-only so audio can never keep video from coming up.
@@ -525,16 +572,18 @@ async def handle_start(request: web.Request) -> web.Response:
             return web.json_response({"rtsp_url": read_url, "reused": True})
         old = SESSIONS.pop(device_id, None)
     if old:
-        old.stop()
+        # Off the event loop: a blocking stop here is what froze /health and
+        # /start for 27 h on 2026-11-04.
+        await asyncio.get_running_loop().run_in_executor(None, _stop_session, old)
 
     cfg = parse_live_config(payload)
     with SESSIONS_LOCK:
         sess = _spawn_session(device_id, cfg, pub, read_url, attempts=0)
-    # give it a moment to connect/publish
+    # give it a moment to connect/publish (without blocking other requests)
     for _ in range(60):
         if sess.started:
             break
-        time.sleep(0.2)
+        await asyncio.sleep(0.2)
     _LOG.info("[%s] start returned (started=%s)", device_id, sess.started)
     return web.json_response({"rtsp_url": read_url, "started": sess.started})
 
@@ -568,7 +617,7 @@ def _watchdog() -> None:
                 _LOG.info("[%s] stale (no frames %.1fs) -> auto-reconnect %d/%d",
                           dev, now - sess.last_sample_ts, attempts, MAX_AUTO_RECONNECTS)
                 cfg, pub, read_url = sess.cfg, sess.publish_url, sess.read_url
-                sess.stop()
+                _stop_session(sess)
                 with SESSIONS_LOCK:
                     if SESSIONS.get(dev) is sess:  # not replaced by HA meanwhile
                         _spawn_session(dev, cfg, pub, read_url, attempts=attempts)
@@ -580,7 +629,7 @@ async def handle_stop(request: web.Request) -> web.Response:
     device_id = request.match_info["device_id"]
     sess = SESSIONS.pop(device_id, None)
     if sess:
-        sess.stop()
+        await asyncio.get_running_loop().run_in_executor(None, _stop_session, sess)
     return web.json_response({"stopped": bool(sess)})
 
 
@@ -613,6 +662,9 @@ if __name__ == "__main__":
     _LOG.info("TELUS GStreamer bridge on :%d  publish=%s read=%s",
               LISTEN_PORT, RTSP_PUBLISH_BASE, RTSP_READ_BASE)
     threading.Thread(target=_watchdog, daemon=True).start()
-    _LOG.info("watchdog started (stale>%ss, grace=%ss, max_reconnects=%d)",
-              STREAM_STALE_SEC, STARTUP_GRACE_SEC, MAX_AUTO_RECONNECTS)
+    _LOG.info("watchdog started (stale>%ss, grace=%ss, max_reconnects=%d, stop_timeout=%ss)",
+              STREAM_STALE_SEC, STARTUP_GRACE_SEC, MAX_AUTO_RECONNECTS, STOP_TIMEOUT_SEC)
+    # `docker kill -s USR1 <bridge container>` dumps every thread's stack to
+    # stderr (docker logs), so a future hang can be located instead of guessed.
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
     web.run_app(make_app(), host="0.0.0.0", port=LISTEN_PORT)

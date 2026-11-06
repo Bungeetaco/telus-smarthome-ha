@@ -4,6 +4,22 @@ All notable changes to this project are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/). It is **pre-1.0** — expect
 breaking changes between minor versions until the API surface stabilizes.
 
+## [Unreleased]
+
+### Fixed (gst_bridge)
+- The bridge could hang for good after a stale-session restart. `GstSession.stop()`
+  tore the GStreamer pipeline down (`set_state(NULL)`) in the caller's thread; when
+  webrtcbin was wedged that call never returned, and because HA's next
+  `/session/<id>/start` ran it inside the aiohttp event loop, `/health` and
+  `/start` stopped answering entirely (observed 2026-11-04 22:23 UTC: 27 h
+  unhealthy, HA logging "Bridge unreachable" every minute, the doorbell stream
+  dark). Teardown now runs on the session's own thread after its GLib loop
+  exits, `stop()` only issues quick bounded calls (websocket close with a 1 s
+  timeout, ffmpeg terminate, loop quit), callers wait at most `STOP_TIMEOUT_SEC`
+  (5) for it, and the start handler awaits instead of sleeping on the loop.
+  `SIGUSR1` now dumps every thread's stack (`faulthandler`) so a future hang
+  can be located from `docker logs`.
+
 ## [0.12.1]
 
 ### Fixed
