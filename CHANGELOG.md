@@ -20,12 +20,56 @@ breaking changes between minor versions until the API surface stabilizes.
   `backoff: true` while waiting. Observed afterwards: one offer per ~3 min and
   the connectivity flapping slowed to match.
 
+### Fixed (gst_bridge) — MPEG-TS instead of Matroska
+- **A mid-session H.264 parameter change ended the session.** The Matroska
+  path (below) died with `gst_matroska_mux_video_pad_setcaps: Could not
+  multiplex stream` the moment the camera sent a new SPS (day/night or
+  bitrate switch): a streamable Matroska header cannot take new codec data.
+  That ended a 95-minute session at 16:58 UTC on 2026-11-12 and, through the
+  resulting rotation, left Frigate's doorbell capture process dead (the
+  second "doorbell offline" of the day). The container is now MPEG-TS
+  (`mpegtsmux`, H.264 as byte-stream with SPS/PPS in-band via `h264parse
+  config-interval=-1`, Opus as-is; `ffmpeg -f mpegts -i pipe:0`). Parameter
+  changes flow through; a test switches the resolution mid-stream and asserts
+  the output decodes at both sizes (the same test fails on the Matroska
+  chain).
+- Four things that only showed up live, each with a regression test:
+  - `mpegtsmux` pushes buffer *lists*; the fdsink heartbeat probe was
+    BUFFER-only, never fired, and the watchdog killed every healthy session
+    as "stale" after 8 s (`OUT_PROBE_TYPE` now includes `BUFFER_LIST`).
+  - `mpegtsmux` request pads are named by PID; `sink_0`/`sink_1` are rejected
+    (PIDs below 0x40 are reserved), so the branches link to `sink_64`/`sink_65`.
+  - The SDP carries no `sprop-parameter-sets` and the camera's first IDR did
+    not always bring its SPS/PPS, so the TS opened on an undecodable keyframe
+    and ffmpeg's probe ended with "Could not find codec parameters ...
+    unspecified size". The depayloader now outputs AVC and `h264parse`
+    converts back to byte-stream, putting SPS/PPS in front of every keyframe
+    including the first (`test_stream_opens_with_sps_pps_even_without_sprop`).
+  - Audio that arrived while the depayloader was still waiting for the first
+    keyframe came out of the mux first and alone (DTS order), so ffmpeg's
+    probe window closed on audio only. Audio is now dropped until the first
+    video keyframe has passed (`pre_keyframe_audio_dropped` in `/health`);
+    video is gated on a keyframe too, with an upstream `GstForceKeyUnit`
+    (PLI) request once per second while waiting (`pre_keyframe_dropped`).
+- ffmpeg's TS probe always runs the full `-analyzeduration` (MPEG-TS has no
+  header), so it *is* the start-up delay: 1 s now (`-probesize 2000000`),
+  measured 1-2 s from "publishing" to MediaMTX "is publishing" (was 4 s with
+  the 4 s window tried first).
+- `/health` per session now also reports `last_au_age_s` per track (which
+  track starved tells a camera pause from a mux stall), the two pre-keyframe
+  drop counters, and the bridge logs ffmpeg's exit code (`rc=255` = killed by
+  us, `rc=1` = ffmpeg gave up on its own, `rc=0` = EOF on its stdin).
+- Guarded `_running_time()` against probes that fire while the pipeline is
+  already torn down (a burst of `AttributeError: 'NoneType'` tracebacks per
+  teardown).
+
 ### Fixed (gst_bridge) — real timestamps end to end
 - **Video was published at a fixed 19 fps clock regardless of the camera's real
   14-30 fps**, so Frigate recordings ran fast or slow against their audio and a
   10 s segment held 10·fps/19 s of playback. The bridge wrote bare Annex-B
   H.264 into ffmpeg, which can carry no timestamps; ffmpeg then stamped every
-  frame from the SPS VUI timing. The media path is now muxed in GStreamer:
+  frame from the SPS VUI timing. The media path is now muxed in GStreamer (Matroska at first, MPEG-TS
+  since the entry above):
   `rtph264depay ! h264parse ! queue ! matroskamux` with the camera's Opus
   (`rtpopusdepay ! opusparse ! queue ! matroskamux`) in the same Matroska
   stream, written by `fdsink` straight into `ffmpeg -f matroska -i pipe:0`,

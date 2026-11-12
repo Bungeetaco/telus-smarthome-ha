@@ -39,9 +39,10 @@ import websocket  # websocket-client (sync)
 
 import gi
 gi.require_version("Gst", "1.0")
+gi.require_version("GstVideo", "1.0")
 gi.require_version("GstWebRTC", "1.0")
 gi.require_version("GstSdp", "1.0")
-from gi.repository import Gst, GstWebRTC, GstSdp, GLib  # noqa: E402
+from gi.repository import Gst, GstVideo, GstWebRTC, GstSdp, GLib  # noqa: E402
 
 Gst.init(None)
 
@@ -103,7 +104,7 @@ STOP_TIMEOUT_SEC = max(float(os.environ.get("STOP_TIMEOUT_SEC", "5")),
 # hand a whole cluster over in one write.
 PIPE_BUFFER_BYTES = int(os.environ.get("PIPE_BUFFER_BYTES", str(1 << 20)))
 # webrtcbin adds its audio and video pads a few ms apart. The Matroska muxer
-# needs every track before it writes the header, so the first pad starts this
+# wants every track before it starts, so the first pad starts this
 # timer and the chain is built when the second pad arrives or the timer fires
 # (video-only if audio never showed up).
 PAD_SETTLE_MS = int(os.environ.get("PAD_SETTLE_MS", "1500"))
@@ -203,10 +204,10 @@ _ALL_SESSIONS_LOCK = threading.Lock()
 # The production media chain, in one place so a test can run the exact same
 # description against videotestsrc/x264enc/rtph264pay (+ audiotestsrc/opusenc).
 #
-# Why Matroska: a raw Annex-B pipe carries no timestamps, so ffmpeg used to
+# Why a container at all: a raw Annex-B pipe carries no timestamps, so ffmpeg used to
 # stamp every frame from the SPS VUI (a fixed 19 fps on this camera) while the
 # real rate is 14-30 fps -- recordings ran fast or slow against their audio and
-# ffmpeg's interleaver held one stream back for seconds. matroskamux writes the
+# ffmpeg's interleaver held one stream back for seconds. The muxer writes the
 # jitterbuffer's PTS for both tracks into the container; ffmpeg reads them.
 #
 # request-keyframe: a PLI goes back to the camera when the depayloader sees RTP
@@ -228,19 +229,37 @@ _ALL_SESSIONS_LOCK = threading.Lock()
 # blocks when the pipe is full, the queues then drop upstream instead of
 # back-pressuring the jitterbuffer, and the heartbeat (a probe on fdsink's
 # sink pad) stops, so the watchdog restarts the session.
+# Container: MPEG-TS, not Matroska. Matroska (tried first, 2026-11-12) fails
+# with "Could not multiplex stream" the moment the camera changes its H.264
+# parameters mid-session (a new SPS on a day/night or bitrate switch): a
+# streamable Matroska header cannot take new codec data, and that ended a
+# 95-minute session and tripped Frigate. MPEG-TS carries PTS just the same but
+# takes H.264 as byte-stream with SPS/PPS in-band, so parameter changes simply
+# flow through, exactly as the raw pipe used to tolerate.
+# The depayloader is asked for AVC (codec_data from the SDP's
+# sprop-parameter-sets, or from the first in-band SPS/PPS) and h264parse
+# converts to byte-stream with config-interval=-1, so SPS/PPS sit in front of
+# EVERY keyframe including the first one. Without that the stream opened on an
+# IDR the camera sent without its parameter sets, ffmpeg's probe ended with
+# "Could not find codec parameters ... unspecified size" and the session died.
 VIDEO_BRANCH = (
     "rtph264depay name=vdepay request-keyframe=true wait-for-keyframe=true ! "
-    "video/x-h264,alignment=au ! h264parse ! "
-    "video/x-h264,stream-format=avc,alignment=au ! "
+    "video/x-h264,stream-format=avc,alignment=au ! h264parse config-interval=-1 ! "
+    "video/x-h264,stream-format=byte-stream,alignment=au ! "
     "queue name=vq leaky=downstream max-size-time=5000000000 max-size-buffers=0 max-size-bytes=0 ! "
-    "mux.video_0"
+    "mux.sink_64"   # mpegtsmux pads are named by PID; PIDs below 0x40 are reserved
 )
 AUDIO_BRANCH = (
     "rtpopusdepay name=adepay ! opusparse ! "
     "queue name=aq leaky=downstream max-size-time=5000000000 max-size-buffers=0 max-size-bytes=0 ! "
-    "mux.audio_0"
+    "mux.sink_65"
 )
-MUX_CHAIN = "matroskamux name=mux streamable=true ! fdsink name=out sync=false fd=%d"
+MUX_CHAIN = "mpegtsmux name=mux ! fdsink name=out sync=false fd=%d"
+# The heartbeat probe on fdsink must accept buffer LISTS: mpegtsmux pushes one
+# list per PES and never a single buffer, so a BUFFER-only probe never fires
+# and the watchdog kills a healthy session as "stale" after 8 s (2026-11-12).
+OUT_PROBE_TYPE = Gst.PadProbeType.BUFFER | Gst.PadProbeType.BUFFER_LIST
+MUX_AUDIO_PAD = "sink_65"
 
 
 def build_chain(fd: int, audio: bool) -> str:
@@ -363,6 +382,11 @@ class GstSession:
         self._arrival: dict[int, dict[int, int]] = {}   # ssrc -> {seq: arrival running time (ns)}
         self._pll = {"video": _Pll(33_000_000), "audio": _Pll(20_000_000)}
         self._au_no_pts = 0
+        self._kf_seen = False          # video: first keyframe passed the gate
+        self._pre_kf_dropped = 0       # video AUs dropped before it
+        self._pre_kf_audio_dropped = 0 # audio AUs dropped before it
+        self._last_kf_request = 0.0
+        self._last_au_ts = {"video": 0.0, "audio": 0.0}
         self._restamped = 0
         self._unstamped = 0                              # packets whose arrival was unknown
         # Diagnostics: inter-arrival histograms at two points (see /health).
@@ -720,7 +744,10 @@ class GstSession:
             return
         caps = pad.get_current_caps()
         name = caps.to_string() if caps else ""
-        _LOG.info("[%s] pad-added: %s", self.device_id, name[:80])
+        # Note whether the SDP carried SPS/PPS: with them h264parse can put the
+        # parameter sets in front of the very first keyframe (see VIDEO_BRANCH).
+        _LOG.info("[%s] pad-added: %s%s", self.device_id, name[:80],
+                  " [sprop-parameter-sets present]" if "sprop-parameter-sets" in name else "")
         kind = "audio" if "audio" in name else "video" if "video" in name else None
         if kind is None:
             return
@@ -768,10 +795,10 @@ class GstSession:
 
     def _settle_locked(self) -> None:
         if "audio" not in self._pads and self.audio:
-            # Let the muxer write a video-only header instead of waiting for a
-            # track that is not coming.
+            # Let the muxer start video-only instead of waiting for a track
+            # that is not coming.
             mux = self._chain.get_by_name("mux")
-            apad = mux.get_static_pad("audio_0")
+            apad = mux.get_static_pad(MUX_AUDIO_PAD)
             aq = self._chain.get_by_name("aq")
             if apad is not None:
                 if aq is not None:
@@ -784,7 +811,7 @@ class GstSession:
                          self.device_id, PAD_SETTLE_MS)
 
     def _build_chain(self) -> bool:
-        """Spawn ffmpeg and create matroskamux -> fdsink plus a branch (with a
+        """Spawn ffmpeg and create mpegtsmux -> fdsink plus a branch (with a
         ghost sink pad) for every expected track. Returns False on failure."""
         self._chain_built = True
         try:
@@ -819,7 +846,7 @@ class GstSession:
         # Heartbeat and byte counters: buffers reaching fdsink are what ffmpeg
         # actually gets; buffers leaving the branch queues count per track.
         chain.get_by_name("out").get_static_pad("sink").add_probe(
-            Gst.PadProbeType.BUFFER, self._on_out_buffer, None)
+            OUT_PROBE_TYPE, self._on_out_buffer, None)
         chain.get_by_name("vdepay").get_static_pad("src").add_probe(
             Gst.PadProbeType.BUFFER, self._on_au, "video")
         chain.get_by_name("vq").connect("overrun", self._on_video_overrun)
@@ -838,10 +865,13 @@ class GstSession:
 
     # ---- arrival-time stamping (see the comment above VIDEO_BRANCH) ----
     def _running_time(self) -> int:
-        clock = self.pipe.get_clock()
+        pipe = self.pipe
+        if pipe is None:  # probes can still fire while the pipeline is torn down
+            return Gst.CLOCK_TIME_NONE
+        clock = pipe.get_clock()
         if clock is None:
             return Gst.CLOCK_TIME_NONE
-        return clock.get_time() - self.pipe.get_base_time()
+        return clock.get_time() - pipe.get_base_time()
 
     def _on_new_jitterbuffer(self, rtpbin, jb, session, ssrc):
         self._arrival[ssrc] = {}
@@ -913,8 +943,41 @@ class GstSession:
 
     def _on_au(self, pad, info, kind):
         """Per track: count bytes and replace the (arrival-time) PTS with the
-        smoothed, monotonic clock from _Pll."""
+        smoothed, monotonic clock from _Pll. Video is gated on the first
+        keyframe: the stream must open with SPS/PPS/IDR."""
         buf = info.get_buffer()
+        self._last_au_ts[kind] = time.time()
+        if kind == "audio" and not self._kf_seen:
+            # No audio before the first video keyframe. The muxer emits in DTS
+            # order, so audio that arrived while the depayloader was still
+            # waiting for a keyframe would come out first and alone; ffmpeg's
+            # probe window (analyzeduration, measured on the stream that has
+            # advanced furthest) then closed on audio only and the session
+            # died with "Could not find codec parameters" (2026-11-12).
+            self._pre_kf_audio_dropped += 1
+            return Gst.PadProbeReturn.DROP
+        if kind == "video" and not self._kf_seen:
+            if buf.has_flags(Gst.BufferFlags.DELTA_UNIT):
+                # The camera does not start a session on an IDR, and
+                # rtph264depay's wait-for-keyframe only applies after packet
+                # loss. Mid-GOP frames are useless to the decoder and, in an
+                # MPEG-TS, keep ffmpeg's probe from finding the picture size
+                # ("Could not find codec parameters ... unspecified size", two
+                # sessions in a row on 2026-11-12). Drop them and ask upstream
+                # (rtpsession -> PLI) for a keyframe, once per second.
+                self._pre_kf_dropped += 1
+                now = time.monotonic()
+                if now - self._last_kf_request >= 1.0:
+                    self._last_kf_request = now
+                    # send_event on the depayloader's SRC pad travels upstream
+                    # through it (push_event would go downstream to the muxer)
+                    pad.send_event(GstVideo.video_event_new_upstream_force_key_unit(
+                        Gst.CLOCK_TIME_NONE, True, 0))
+                return Gst.PadProbeReturn.DROP
+            self._kf_seen = True
+            if self._pre_kf_dropped:
+                _LOG.info("[%s] first keyframe after dropping %d mid-GOP frames",
+                          self.device_id, self._pre_kf_dropped)
         pts = buf.pts
         pll = self._pll[kind]
         if pts == Gst.CLOCK_TIME_NONE:
@@ -940,16 +1003,23 @@ class GstSession:
         self.audio_drops += 1
 
     def _ffmpeg_cmd(self, audio: bool) -> list[str]:
-        """ffmpeg reads the Matroska stream on stdin (video + optional Opus
+        """ffmpeg reads the MPEG-TS stream on stdin (video + optional Opus
         audio, timestamps from the jitterbuffer), copies the video, decodes/
         boosts/AAC-encodes the audio and publishes RTSP to MediaMTX.
         -max_interleave_delta bounds how long the muxer may hold one stream
         waiting for the other (default 10 s)."""
         # No `-fflags +nobuffer`: with the Matroska demuxer it dropped a third
         # of the video frames in the in-image test (59 of 90).
+        # Probe bounds. MPEG-TS has no header, so ffmpeg always reads the whole
+        # analyzeduration before it starts publishing (measured: 0.5 s -> 0.5 s,
+        # 4 s -> 4 s). This IS the start-up delay, so keep it short; it is safe
+        # because the muxer only starts once both tracks are present and the
+        # video opens on SPS/PPS/IDR (VIDEO_BRANCH). probesize must cover that
+        # second of video at the camera's ~2.5 Mbit/s with room to spare.
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
                "-thread_queue_size", "512",
-               "-f", "matroska", "-i", "pipe:0", "-map", "0:v", "-c:v", "copy"]
+               "-analyzeduration", "1000000", "-probesize", "2000000",
+               "-f", "mpegts", "-i", "pipe:0", "-map", "0:v", "-c:v", "copy"]
         if audio:
             # "0:a?": optional, so a session whose audio track never arrived
             # (settle timeout) still publishes video.
@@ -976,6 +1046,15 @@ class GstSession:
                     _LOG.warning("[%s] ffmpeg[%d]: %s", self.device_id, proc.pid, text)
         except Exception:
             pass
+        rc = proc.poll()
+        if rc is None:
+            try:
+                rc = proc.wait(timeout=5)
+            except Exception:
+                rc = None
+        # A negative code is the signal that killed it; 0 means ffmpeg saw EOF
+        # on its stdin, i.e. nobody was writing to it any more.
+        _LOG.info("[%s] ffmpeg[%d] exited rc=%s", self.device_id, proc.pid, rc)
 
 
 # --------------------------------------------------------------------------- #
@@ -1224,6 +1303,11 @@ async def handle_health(request: web.Request) -> web.Response:
             "rtp_restamped": s._restamped,
             "rtp_unstamped": s._unstamped,
             "au_without_pts": s._au_no_pts,
+            "pre_keyframe_dropped": s._pre_kf_dropped,
+            "pre_keyframe_audio_dropped": s._pre_kf_audio_dropped,
+            # which track starved tells a mux stall from a camera outage
+            "last_au_age_s": {k: (round(now - t, 1) if t else None)
+                              for k, t in s._last_au_ts.items()},
             "arrival_hist": {k: h.as_dict() for k, h in s._hist.items()},
             "video_drops": s.video_drops,
             "audio_drops": s.audio_drops,

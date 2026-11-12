@@ -230,8 +230,10 @@ loopback-only.
 - Timestamps: `ffprobe -rtsp_transport tcp -show_entries packet=pts_time
   -read_intervals '%+15' rtsp://127.0.0.1:8556/telus_<id>` should take about 15
   wall-clock seconds and show PTS spacing equal to the camera's real frame
-  interval (the bridge muxes the jitterbuffer's PTS into Matroska for ffmpeg;
-  a raw H.264 pipe would make ffmpeg invent a fixed-rate clock).
+  interval (the bridge muxes the jitterbuffer's PTS into MPEG-TS for ffmpeg;
+  a raw H.264 pipe would make ffmpeg invent a fixed-rate clock). Start-up
+  from "publishing" to the stream appearing on MediaMTX is 1-2 s (ffmpeg's
+  1 s TS probe).
 - `docker kill -s USR1 gst_bridge-bridge-1` dumps every thread's stack into the
   container log when something hangs.
 - Docker marks the container unhealthy on HTTP 503 but never restarts it on its
@@ -244,7 +246,7 @@ loopback-only.
 | `WEBRTC_NACK` | `1` | Negotiate RTCP NACK on the video transceiver so lost RTP packets are retransmitted (the camera supports `nack` and `nack pli`). `0` disables. |
 | `WEBRTC_JITTER_MS` | `300` | webrtcbin jitterbuffer depth; must cover one retransmission round trip for NACK to help. |
 | `FFMPEG_KILL_GRACE_SEC` | `3` | After closing ffmpeg's pipes and sending SIGTERM, wait this long before SIGKILL. |
-| `PAD_SETTLE_MS` | `1500` | How long the Matroska muxer waits for the camera's audio pad after the first pad before publishing video-only. |
+| `PAD_SETTLE_MS` | `1500` | How long the MPEG-TS muxer waits for the camera's audio pad after the first pad before publishing video-only. |
 | (timing) | built in | RTP packets are re-stamped with their arrival time and each track runs through a smoothing clock (`_Pll`, ~2 s window); `/health` shows `rtp_restamped`, `rtp_unstamped` and `arrival_hist`. The camera's own RTP clock is frame-count based and its Wi-Fi delivery bursty, see `docs/BACKLOG.md`. |
 | `PIPE_BUFFER_BYTES` | `1048576` | Capacity of ffmpeg's stdin pipe (`F_SETPIPE_SZ`) so `fdsink` hands a whole cluster over in one write. |
 | `BRIDGE_HOST` | `0.0.0.0` | Bind address of the control API. Use `127.0.0.1` when Home Assistant runs on the same host. |
