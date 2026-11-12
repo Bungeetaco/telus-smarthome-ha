@@ -186,3 +186,17 @@ Built through API reverse-engineering of the TELUS SmartHome+ app. TELUS SmartHo
 ## 📄 License
 
 [MIT](LICENSE) © 2026 Akram Mahmoud
+
+### gst_bridge tuning knobs (environment)
+
+| Variable | Default | What it does |
+|---|---|---|
+| `WEBRTC_NACK` | `1` | Negotiate RTCP NACK on the video transceiver so lost RTP packets are retransmitted (the camera supports `nack` and `nack pli`). `0` disables. |
+| `WEBRTC_JITTER_MS` | `300` | webrtcbin jitterbuffer depth; must cover one retransmission round trip for NACK to help. |
+| `FFMPEG_KILL_GRACE_SEC` | `3` | After closing ffmpeg's pipes and sending SIGTERM, wait this long before SIGKILL. |
+| `PIPE_WRITE_TIMEOUT_SEC` | `2` | A video write into ffmpeg that does not finish within this time is dropped (ffmpeg stopped reading) instead of blocking the pipeline. |
+| `STREAM_STALE_SEC` / `STARTUP_GRACE_SEC` / `MAX_AUTO_RECONNECTS` / `STOP_TIMEOUT_SEC` | `8` / `25` / `6` / `5` | Self-healing watchdog (see comments in `telus_gst_bridge.py`). |
+
+`GET /health` includes a `process` block (`fds`, `threads`, `ffmpeg_children`,
+`session_objects`, `wedged_sessions`): more than one ffmpeg child, or fds
+climbing session after session, means a leak.

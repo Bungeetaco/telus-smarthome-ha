@@ -7,6 +7,36 @@ breaking changes between minor versions until the API surface stabilizes.
 ## [Unreleased]
 
 ### Fixed (gst_bridge)
+- **Frigate recordings of the doorbell were full of artifacting (smeared, blocky
+  frames and multi-second freezes).** Two causes, both in the bridge:
+  1. *Leaked sessions.* Every stale-session restart left the previous ffmpeg
+     child alive: `stop()` only sent SIGTERM and never closed the pipes, and
+     ffmpeg 5.1 blocked in `read()` on the video pipe does not act on that flag.
+     Each leaked ffmpeg pinned an audio-writer thread in `write()` on its full
+     audio pipe, and its webrtcbin kept its libnice sockets. After 9 h the bridge
+     had 18 ffmpeg children, 92 threads and 803 of its 1024 file descriptors
+     (gupnp already logging "Too many open files"); the kernel counted 5.8 M
+     UDP receive-buffer drops on the dead sockets. `_kill_ffmpeg()` now closes
+     both pipes (EOF makes ffmpeg finish), then SIGTERM, then SIGKILL after
+     `FFMPEG_KILL_GRACE_SEC` (3 s); pipe writes go through `_write_pipe()` with a
+     bound (`PIPE_WRITE_TIMEOUT_SEC`, 2 s video / 0.5 s audio) and drop instead
+     of blocking a GStreamer streaming thread or the audio writer for good; the
+     watchdog reaps any stopped session whose ffmpeg is still alive; the compose
+     file raises `nofile` to 65536; `/health` reports `process.fds`, `threads`,
+     `ffmpeg_children`, `session_objects`, `wedged_sessions` and per-session
+     `video_drops` / `audio_drops`.
+  2. *No loss recovery on the WebRTC leg.* KVS delivers RTP over UDP; a
+     1440x1920 keyframe is ~115 KB = ~95 packets, so one lost packet discarded
+     the whole keyframe and every P-frame of that GOP then referenced a picture
+     that never arrived. Measured before the fix: 6 of 50 keyframes lost in
+     45 s on a quiet night, 12 of 14 inside one 17 s recording (36 decodable
+     frames out of 250, the rest "no picture ooo"). The video transceiver now
+     sets `do-nack` (the camera answers `a=rtcp-fb:101 nack` and `nack pli`),
+     webrtcbin `latency` is `WEBRTC_JITTER_MS` (300 ms) so a retransmit has time
+     to land, and the depayloader runs `request-keyframe=true` (PLI on loss)
+     `wait-for-keyframe=true` with AU alignment so a broken GOP is dropped
+     rather than forwarded smeared. Measured after: 44 of 44 keyframes in 45 s,
+     0 decoder-dropped frames. `WEBRTC_NACK=0` turns the NACK negotiation off.
 - The bridge could hang for good after a stale-session restart. `GstSession.stop()`
   tore the GStreamer pipeline down (`set_state(NULL)`) in the caller's thread; when
   webrtcbin was wedged that call never returned, and because HA's next

@@ -44,6 +44,13 @@ services:
     memswap_limit: 768m
     cpus: 2.0
     pids_limit: 256
+    # libnice opens many UDP sockets per WebRTC session; the Docker default soft
+    # limit of 1024 fds was within reach after a day of reconnects (803 used on
+    # 2026-11-12, gupnp already logging "Too many open files").
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     logging: *logging
     healthcheck:
       test: ["CMD", "python3", "-c",

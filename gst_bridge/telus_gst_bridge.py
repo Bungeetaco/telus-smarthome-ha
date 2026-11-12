@@ -20,6 +20,7 @@ import base64
 import faulthandler
 import json
 import os
+import select
 import signal
 import subprocess
 import threading
@@ -59,6 +60,29 @@ MAX_AUTO_RECONNECTS = int(os.environ.get("MAX_AUTO_RECONNECTS", "6"))  # before 
 # How long a caller waits for a session's stop() before leaving it to finish in
 # the background. Tearing down a wedged webrtcbin can block indefinitely.
 STOP_TIMEOUT_SEC = float(os.environ.get("STOP_TIMEOUT_SEC", "5"))
+# ffmpeg child shutdown: its stdin pipes are closed first (EOF makes it finish
+# on its own), then SIGTERM, then SIGKILL after this grace. Before 2026-11-12 the
+# bridge only sent SIGTERM and never closed the pipes; ffmpeg 5.1 blocked in
+# read() on the video pipe ignores that flag, so every stale-session restart
+# left one ffmpeg (and one audio-writer thread blocked on its full pipe) behind:
+# 17 leaked ffmpegs and 803 of 1024 fds after 9 h.
+FFMPEG_KILL_GRACE_SEC = float(os.environ.get("FFMPEG_KILL_GRACE_SEC", "3"))
+# A pipe write that does not complete within this long means ffmpeg has stopped
+# reading; the data is dropped instead of blocking a GStreamer streaming thread
+# (video) or the audio writer forever.
+PIPE_WRITE_TIMEOUT_SEC = float(os.environ.get("PIPE_WRITE_TIMEOUT_SEC", "2"))
+# Packet-loss handling on the WebRTC leg. KVS is UDP; a 1440x1920 keyframe is
+# ~115 KB = ~95 RTP packets, so without retransmission a single lost packet
+# destroys the whole keyframe. Measured 2026-11-12 before this: 6 of 50
+# keyframes lost in 45 s on a quiet night, 12 of 14 in a busy 17 s recording,
+# which is the "artifacting" in Frigate's recordings (P-frames referencing a
+# keyframe that never arrived). do-nack negotiates RTCP NACK so lost packets are
+# re-sent; the jitterbuffer has to hold packets long enough for the retransmit
+# to arrive (one RTT to the camera via AWS). request-keyframe sends a PLI when
+# loss is detected anyway, and wait-for-keyframe drops the broken remainder of
+# the GOP instead of forwarding smeared frames.
+WEBRTC_NACK = os.environ.get("WEBRTC_NACK", "1") not in ("0", "false", "no", "")
+WEBRTC_JITTER_MS = int(os.environ.get("WEBRTC_JITTER_MS", "300"))
 
 # Audio (Opus -> AAC). The video path is untouched by audio: audio rides a
 # separate pipe into the SAME ffmpeg and is fed continuously (silence when the
@@ -140,9 +164,21 @@ def get_ice_servers(c: dict, client_id: str) -> list[str]:
 # --------------------------------------------------------------------------- #
 # One GStreamer webrtcbin viewer session (runs in its own thread + GLib loop)
 # --------------------------------------------------------------------------- #
+# Every session ever created, so the watchdog can reap what a bounded stop()
+# left behind (a wedged pipeline teardown must not keep an ffmpeg alive).
+_ALL_SESSIONS: list["GstSession"] = []
+_ALL_SESSIONS_LOCK = threading.Lock()
+
+
 class GstSession:
     def __init__(self, device_id: str, cfg: dict, publish_url: str, read_url: str,
                  audio: bool = False):
+        self._stop_ts = 0.0                # when stop() was first called (0 = running)
+        self._ffmpeg_lock = threading.Lock()
+        self._rtcp_fb_logged = False
+        self.ffmpeg_exited = False
+        self.video_drops = 0               # video AUs dropped because ffmpeg stopped reading
+        self.audio_drops = 0
         self.audio = audio                 # request + publish audio for this session
         self.audio_active = False          # real camera audio is arriving
         self.audio_bytes = 0
@@ -168,6 +204,8 @@ class GstSession:
         self._ws_queue = []
         self._stopping = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
+        with _ALL_SESSIONS_LOCK:
+            _ALL_SESSIONS.append(self)
 
     def is_healthy(self) -> bool:
         """True while video is actually flowing (a frame within STREAM_STALE_SEC)."""
@@ -197,6 +235,8 @@ class GstSession:
         old stop() ran pipe.set_state(NULL) in the caller's thread, and HA's
         next /start called it from inside the aiohttp event loop.
         """
+        if not self._stop_ts:
+            self._stop_ts = time.time()
         self._stopping.set()
         try:
             if self.ws:
@@ -204,16 +244,93 @@ class GstSession:
         except Exception:
             pass
         self._audio_stop.set()
-        if self.ffmpeg:
-            try:
-                self.ffmpeg.terminate()
-            except Exception:
-                pass
         if self.loop:
             self.loop.quit()
+        # Bounded (pipes closed -> EOF, SIGTERM, SIGKILL after the grace); this
+        # runs on the stop() helper thread, never on the aiohttp loop.
+        self._kill_ffmpeg()
+
+    def _kill_ffmpeg(self) -> None:
+        """Close ffmpeg's input pipes and make sure the child is gone. Idempotent,
+        safe from any thread, bounded to FFMPEG_KILL_GRACE_SEC + 2 s.
+
+        Closing the pipes matters more than the signal: ffmpeg 5.1 blocked in
+        read() on the video pipe does not act on SIGTERM, but EOF makes it
+        finish. Closing the read side also unblocks an audio writer stuck in
+        write() on the full audio pipe (EPIPE)."""
+        with self._ffmpeg_lock:
+            proc, self.ffmpeg = self.ffmpeg, None
+            aw, self._audio_w = self._audio_w, None
+        if aw is not None:
+            try:
+                aw.close()
+            except Exception:
+                pass
+        if proc is None:
+            return
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=FFMPEG_KILL_GRACE_SEC)
+            except subprocess.TimeoutExpired:
+                _LOG.warning("[%s] ffmpeg %d ignored SIGTERM for %.0fs; killing",
+                             self.device_id, proc.pid, FFMPEG_KILL_GRACE_SEC)
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        self.ffmpeg_exited = True
+
+    def ffmpeg_alive(self) -> bool:
+        proc = self.ffmpeg
+        return proc is not None and proc.poll() is None
+
+    def _write_pipe(self, fobj, data, timeout: float) -> bool:
+        """Write `data` to a non-blocking pipe, waiting at most `timeout` seconds
+        in total for ffmpeg to drain it. Returns False (data partly or wholly
+        dropped) if ffmpeg stopped reading or is gone. Never blocks for good."""
+        if fobj is None:
+            return False
+        try:
+            fd = fobj.fileno()
+        except Exception:
+            return False
+        view = memoryview(data)
+        deadline = time.monotonic() + timeout
+        while view:
+            try:
+                n = os.write(fd, view)
+                view = view[n:]
+                continue
+            except BlockingIOError:
+                pass
+            except OSError:
+                return False  # EPIPE / closed: ffmpeg is gone
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                _, ready, _ = select.select([], [fd], [], remaining)
+            except (OSError, ValueError):
+                return False
+            if not ready:
+                return False
+        return True
 
     def _teardown(self):
         """Release the pipeline. Runs on the session thread only."""
+        self._kill_ffmpeg()  # idempotent; covers a stop() that never ran
         pipe, self.pipe = self.pipe, None
         if pipe is None:
             return
@@ -221,6 +338,8 @@ class GstSession:
             pipe.set_state(Gst.State.NULL)
         except Exception as err:  # noqa: BLE001
             _LOG.warning("[%s] pipeline teardown failed: %s", self.device_id, err)
+        _LOG.info("[%s] session torn down (video drops=%d, audio drops=%d)",
+                  self.device_id, self.video_drops, self.audio_drops)
 
     # ---- thread entry ----
     def _run(self):
@@ -239,6 +358,9 @@ class GstSession:
             self.pipe = Gst.Pipeline.new(f"pipe-{dev}")
             self.webrtc = Gst.ElementFactory.make("webrtcbin", "wb")
             self.webrtc.set_property("bundle-policy", "max-bundle")
+            # Jitterbuffer depth: must cover one retransmission round trip for
+            # NACK to be worth anything (default 200 ms).
+            self.webrtc.set_property("latency", WEBRTC_JITTER_MS)
             if stun:
                 self.webrtc.set_property("stun-server", stun)
             self.pipe.add(self.webrtc)
@@ -249,10 +371,14 @@ class GstSession:
             caps_v = Gst.Caps.from_string(
                 "application/x-rtp,media=video,encoding-name=H264,payload=101,clock-rate=90000"
             )
-            self.webrtc.emit(
+            trans_v = self.webrtc.emit(
                 "add-transceiver",
                 GstWebRTC.WebRTCRTPTransceiverDirection.RECVONLY, caps_v,
             )
+            if WEBRTC_NACK and trans_v is not None:
+                # Puts "a=rtcp-fb:101 nack" in the offer so lost RTP packets are
+                # retransmitted instead of taking the whole keyframe with them.
+                trans_v.set_property("do-nack", True)
 
             if self.audio:
                 caps_a = Gst.Caps.from_string(
@@ -334,6 +460,15 @@ class GstSession:
             self.webrtc.emit("set-remote-description", answer, p)
             p.interrupt()
             _LOG.info("[%s] applied SDP answer", self.device_id)
+            if not self._rtcp_fb_logged:
+                # What the camera agreed to: "nack" = retransmission, "nack pli"
+                # = it will send a new keyframe when asked. Absent lines mean the
+                # loss handling below falls back to PLI/wait-for-keyframe only.
+                self._rtcp_fb_logged = True
+                fb = sorted({ln.strip() for ln in sdp.splitlines()
+                             if ln.startswith("a=rtcp-fb:")})
+                _LOG.info("[%s] answer rtcp-fb: %s", self.device_id,
+                          ", ".join(fb) if fb else "(none)")
         except Exception as err:  # noqa: BLE001
             _LOG.warning("[%s] answer err: %s", self.device_id, err)
         return False
@@ -407,6 +542,7 @@ class GstSession:
                    "-f", "rtsp", "-rtsp_transport", "tcp", self.publish_url]
             self.ffmpeg = subprocess.Popen(cmd, stdin=subprocess.PIPE, pass_fds=(ar,))
             os.close(ar)  # parent keeps only the write end
+            os.set_blocking(aw, False)  # writes are bounded by _write_pipe
             self._audio_w = os.fdopen(aw, "wb", buffering=0)
             threading.Thread(target=self._audio_writer, daemon=True).start()
         else:
@@ -417,8 +553,15 @@ class GstSession:
                  self.publish_url],
                 stdin=subprocess.PIPE,
             )
+        os.set_blocking(self.ffmpeg.stdin.fileno(), False)
+        # request-keyframe: a PLI goes back to the camera when the depayloader
+        # sees RTP loss; wait-for-keyframe: the rest of that GOP is dropped
+        # rather than forwarded as smeared frames (only meaningful with AU
+        # alignment, hence the capsfilter right after the depayloader).
         chain = Gst.parse_bin_from_description(
-            "rtph264depay ! h264parse config-interval=1 ! "
+            "rtph264depay request-keyframe=true wait-for-keyframe=true ! "
+            "video/x-h264,alignment=au ! "
+            "h264parse config-interval=1 ! "
             "video/x-h264,stream-format=byte-stream,alignment=au ! "
             "appsink name=out emit-signals=true sync=false max-buffers=20 drop=false",
             True,
@@ -481,16 +624,19 @@ class GstSession:
         silence = bytes(AUDIO_FRAME_BYTES)
         nxt = time.monotonic()
         while not self._audio_stop.is_set():
+            if not self.ffmpeg_alive():
+                return  # ffmpeg gone / session stopping
             with self._audio_lock:
                 if len(self._audio_buf) >= AUDIO_FRAME_BYTES:
                     chunk = bytes(self._audio_buf[:AUDIO_FRAME_BYTES])
                     del self._audio_buf[:AUDIO_FRAME_BYTES]
                 else:
                     chunk = silence
-            try:
-                self._audio_w.write(chunk)
-            except Exception:
-                return  # ffmpeg gone / session stopping
+            # Bounded: a full pipe means ffmpeg stopped reading (its video input
+            # stalled, or it is dying). Drop the chunk; never block for good
+            # here, which is what pinned 17 writer threads before 2026-11-12.
+            if not self._write_pipe(self._audio_w, chunk, 0.5):
+                self.audio_drops += 1
             nxt += AUDIO_FRAME_SEC
             delay = nxt - time.monotonic()
             if delay > 0:
@@ -500,15 +646,19 @@ class GstSession:
 
     def _on_sample(self, sink):
         sample = sink.emit("pull-sample")
-        if sample and self.ffmpeg and self.ffmpeg.stdin:
+        proc = self.ffmpeg
+        if sample and proc is not None and proc.stdin:
             buf = sample.get_buffer()
             ok, mapinfo = buf.map(Gst.MapFlags.READ)
             if ok:
-                try:
-                    self.ffmpeg.stdin.write(mapinfo.data)
+                # Bounded write: if ffmpeg is not draining the pipe the AU is
+                # dropped and the heartbeat is NOT refreshed, so the watchdog
+                # sees the session as stale and restarts it, instead of this
+                # GStreamer streaming thread blocking here for good.
+                if self._write_pipe(proc.stdin, mapinfo.data, PIPE_WRITE_TIMEOUT_SEC):
                     self.last_sample_ts = time.time()  # heartbeat: video is flowing
-                except Exception:
-                    pass
+                else:
+                    self.video_drops += 1
                 buf.unmap(mapinfo)
         return Gst.FlowReturn.OK
 
@@ -588,6 +738,54 @@ async def handle_start(request: web.Request) -> web.Response:
     return web.json_response({"rtsp_url": read_url, "started": sess.started})
 
 
+def _reap_stopped_sessions() -> None:
+    """Forget sessions that are fully gone; kill the ffmpeg of any session that
+    was stopped but whose thread is still around (a wedged pipeline teardown
+    must never keep a child process, its pipes or a writer thread alive)."""
+    with _ALL_SESSIONS_LOCK:
+        sessions = list(_ALL_SESSIONS)
+    now = time.time()
+    gone = []
+    for s in sessions:
+        if s._stop_ts and (now - s._stop_ts) > STOP_TIMEOUT_SEC and s.ffmpeg_alive():
+            _LOG.warning("[%s] stopped %.0fs ago but ffmpeg still alive; reaping",
+                         s.device_id, now - s._stop_ts)
+            s._kill_ffmpeg()
+        if not s._thread.is_alive() and not s.ffmpeg_alive():
+            gone.append(s)
+    if gone:
+        with _ALL_SESSIONS_LOCK:
+            for s in gone:
+                try:
+                    _ALL_SESSIONS.remove(s)
+                except ValueError:
+                    pass
+
+
+def _process_metrics() -> dict:
+    """Leak indicators for /health: before 2026-11-12 these would have read
+    803 fds / 92 threads / 18 ffmpeg children after 9 h of uptime."""
+    try:
+        fds = len(os.listdir("/proc/self/fd"))
+    except OSError:
+        fds = None
+    with _ALL_SESSIONS_LOCK:
+        sessions = list(_ALL_SESSIONS)
+    now = time.time()
+    return {
+        "fds": fds,
+        "threads": threading.active_count(),
+        "ffmpeg_children": sum(1 for s in sessions if s.ffmpeg_alive()),
+        "session_objects": len(sessions),
+        # stopped > 60 s ago and the session thread is still alive: a wedged
+        # webrtcbin teardown (set_state(NULL) never returned).
+        "wedged_sessions": sum(
+            1 for s in sessions
+            if s._stop_ts and (now - s._stop_ts) > 60 and s._thread.is_alive()
+        ),
+    }
+
+
 def _watchdog() -> None:
     """Heal sessions without waiting for HA: if video has stopped flowing,
     restart the session using the stored (still-valid) credentials. After
@@ -597,6 +795,7 @@ def _watchdog() -> None:
     while True:
         time.sleep(WATCHDOG_INTERVAL_SEC)
         try:
+            _reap_stopped_sessions()
             with SESSIONS_LOCK:
                 items = list(SESSIONS.items())
             now = time.time()
@@ -644,10 +843,13 @@ async def handle_health(request: web.Request) -> web.Response:
             "audio_requested": s.audio,
             "audio_active": s.audio_active,
             "audio_bytes": s.audio_bytes,
+            "video_drops": s.video_drops,
+            "audio_drops": s.audio_drops,
         }
         for dev, s in list(SESSIONS.items())
     }
-    return web.json_response({"ok": True, "sessions": sessions})
+    return web.json_response({"ok": True, "sessions": sessions,
+                              "process": _process_metrics()})
 
 
 def make_app() -> web.Application:
