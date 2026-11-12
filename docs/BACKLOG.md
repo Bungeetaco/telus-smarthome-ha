@@ -1,0 +1,60 @@
+# Backlog — findings not yet applied
+
+Source: four independent reviews (correctness, security, operability, media
+pipeline) of `gst_bridge/` and the bridge-facing parts of the integration on
+2026-11-12, after commit c383a8c. Everything verified-and-cheap went into the
+same-day follow-up commit; this file records what was deliberately left for a
+decision, with the evidence, so "not implemented" never reads as "not wanted".
+
+Severity is against the real deployment: HA, go2rtc, Frigate and the bridge on
+one host (10.13.38.2) that sits on the IoT VLAN.
+
+## A. Deployment / configuration decisions (operator)
+
+| # | Item | Evidence | Proposed change | Effort |
+|---|------|----------|-----------------|--------|
+| A1 | **MediaMTX accepts anonymous RTSP publish and read on every interface of the IoT VLAN.** Any device on 10.13.38.0/24 can watch the doorbell or ANNOUNCE its own H.264 to `telus_db-…` and replace the feed HA/Frigate consume. | `ss` shows `*:8556`; anonymous DESCRIBE from the LAN returns the SDP; MediaMTX 1.9.3 default `authInternalUsers` = any/any. | In the local compose override: `MTX_RTSPADDRESS: 127.0.0.1:8556`, `RTSP_PUBLISH_BASE`/`RTSP_READ_BASE: rtsp://127.0.0.1:8556`, and HA's `go2rtc.yaml` doorbell source → `127.0.0.1`. Every consumer is host-network on this VM, so no functional cost. Alternative if LAN reach is ever needed: `MTX_AUTHINTERNALUSERS` with a publish user embedded in the bridge's publish URL. | S |
+| A2 | **Bridge control API on 0.0.0.0:8787.** A LAN caller can stop the live session or point the bridge at its own signaling/TURN server (reachability oracle into BungeeNet from the one VM allowed through the firewall). | `handle_start` accepts any `wss_endpoint`/`https_endpoint`. | Set `BRIDGE_HOST=127.0.0.1` in the override (knob exists since 2026-11-12) and change the integration's Bridge URL to `http://127.0.0.1:8787`. Optional hardening: shared-secret header, endpoint allow-list `^wss://[a-z0-9.-]+\.kinesisvideo\.<region>\.amazonaws\.com$`. | S |
+| A3 | **Container runs as root with host networking and parses attacker-selectable SDP/RTP/H.264/Opus in C libraries.** | `docker exec id` → uid 0; no `user:`, no `cap_drop`, no `read_only`. | compose: `user: "65534:65534"`, `read_only: true`, `tmpfs: [/tmp]`, `cap_drop: [ALL]`, `security_opt: [no-new-privileges:true]`, `GST_REGISTRY=/tmp/gst-registry.bin HOME=/tmp`. Port 8787 > 1024 so nothing needs privilege. | S |
+| A4 | **Leftover diagnostic dumps in `/config`.** `telus_smarthome_plus_livestream.json` (0644) holds a now-expired AWS temporary credential set + channel ARN; `_dump.json`/`_clips.json` hold household/profile IDs. They ride along in the nightly B2 backup. | `__init__.py` `_dump_livestream`/`_dump_devices`, `media_source.py` `_dump_once` always run once. | Delete the three files; remove the dump calls or gate them behind a debug option. | S |
+| A5 | `.storage/core.config_entries` is 0644 while `.storage/auth` is 0600; it holds the TELUS password and tokens (HA-standard storage, but the mode is an anomaly). | `ls -l` on the HA config dir. | `chmod 600`; watch whether HA rewrites it 0644 and find the writer if so. | S |
+
+## B. Media pipeline (design change, needs a maintenance window)
+
+| # | Item | Evidence | Options | Effort |
+|---|------|----------|---------|--------|
+| B1 | **Video timestamps are fabricated at a fixed 19 fps.** A raw Annex-B pipe carries no PTS; ffmpeg 5.1 stamps every frame from the SPS VUI (`time_scale=38000, num_units_in_tick=1000`) and the `-framerate 30` flag is overridden. The camera really delivers 14–30 fps, so recordings run fast or slow against their (wall-paced) audio, Frigate's 10 s segments hold 10·real_fps/19 s of playback, and ffmpeg's interleaver held one stream back by up to 10 s (now bounded to 1 s by `-max_interleave_delta`). | `ffprobe -show_packets` on the published RTSP: 150 of 151 PTS deltas = 0.052622 s while the arrival rate measured 22.9 fps. `-use_wallclock_as_timestamps 1` was tried 2026-11-12 and rejected: with the 1 MiB pipe ffmpeg drains bursts and stamps a whole burst identically (storm of "Non-monotonous DTS"). | **(a)** Mux in GStreamer and carry the jitterbuffer PTS: `matroskamux streamable=true ! queue leaky=downstream ! fdsink` into ffmpeg `-f matroska`, audio as raw PCM or `opusparse` into the same mux (removes the second pipe and the Python audio writer; startup needs the audio pad before the header, or an `audiotestsrc wave=silence ! audiomixer` guarantee). **(b)** Drop ffmpeg: `apt-get install gstreamer1.0-rtsp` and publish with `rtspclientsink` (Opus end-to-end, or `voaacenc` for AAC); removes the child process and the kill/EOF machinery. **(c)** Spike: HA's go2rtc 1.9.x has `webrtc:` source `#format=kinesis` (used for Ring); the bridge would shrink to a URL signer. Add a timestamp-contract test first (see tests/). | M / M-L / L |
+| B2 | Dedicated writer thread with a GOP-aware bounded deque instead of writing on the depayloader's streaming thread. Only worth it if B1(a)/(b) are not done; with them the `queue leaky=downstream` does it in C. | `_on_sample` runs on the GStreamer streaming thread; a stall of `PIPE_WRITE_TIMEOUT_SEC` back-pressures the jitterbuffer. Mitigated 2026-11-12 (1 MiB pipe, 0.5 s bound, IDR wait after a drop). | — | M |
+
+## C. Observability / UX (integration side)
+
+| # | Item | Proposed change | Effort |
+|---|------|-----------------|--------|
+| C1 | **Nothing in Home Assistant reflects bridge health.** Leaks and a 27 h outage were invisible except in Frigate recordings and docker logs. | Poll `{bridge_url}/health` every 30 s from the coordinator: `binary_sensor.<camera>_bridge_stream` (device_class connectivity; on = reachable and this device's session `healthy`) with attributes `secs_since_frame, reconnect_attempts, reconnects_total, gave_up, nack_negotiated, audio_fallback, video_drops, audio_drops, fds, ffmpeg_children, wedged_sessions, version`; `sensor.<camera>_bridge_reconnects` (total_increasing). All fields exist in `/health` since 2026-11-12. | M |
+| C2 | `camera.py` ignores `started=false` in the `/start` response and its error lines carry no device id or bridge URL. | Warn when `started` is false (`reused` too); prefix the three error logs with device_id and bridge_url; document the 45 s HA timeout vs the bridge's 12 s wait. | S |
+| C3 | Bridge URL never validated in the config flow; `LAN_IP` unset is the #1 support issue (CHANGELOG 0.7.1) and the compose override's semantics are undocumented. | `GET {bridge_url}/health` in both flows with a clear error string; README paragraph on `docker-compose.override.yml` (auto-merged, gitignored, `docker compose config` shows the result) and on moving MediaMTX off 8554. (Bridge-side startup warning for a loopback `RTSP_READ_BASE` added 2026-11-12.) | S |
+| C4 | Audio fallback (video-only after `AUDIO_FALLBACK_AFTER` failed reconnects) changes MediaMTX's track count under running readers, so go2rtc/Frigate must reconnect and recordings silently lose sound. | Log it at WARNING (done) and surface `audio_fallback` in HA (C1); consider keeping a silent AAC track in video-only mode so the track count never changes. | S/M |
+| C5 | README still lacks a "Verifying the bridge" section: a healthy `/health` body annotated, the three failure signatures (`secs_since_frame` > 8, `gave_up`, `wedged_sessions` > 0 / `ffmpeg_children` > sessions, MediaMTX "no one is publishing"), the `answer rtcp-fb … nack, nack pli` line, the `SIGUSR1` stack dump, and "Docker marks unhealthy but never restarts; pair with a watchdog". Tuning table should list `ENABLE_AUDIO, AUDIO_GAIN_DB, AUDIO_FALLBACK_AFTER, WATCHDOG_INTERVAL_SEC, RTSP_PUBLISH_BASE, RTSP_READ_BASE, BRIDGE_PORT, BRIDGE_HOST, MAX_SESSIONS`. `docs/ARCHITECTURE.md:100` still says audio is not muxed. | Docs only. | S |
+
+## D. Image / build
+
+| # | Item | Proposed change | Effort |
+|---|------|-----------------|--------|
+| D1 | Image is 1.14 GB; `gstreamer1.0-libav` and `-plugins-ugly` are not in the data path (`x264enc` from -ugly is used only by the test suite), Mesa/VA-API/GTK are pulled transitively and unused. Base image unpinned. | Drop `-libav`; move `-ugly` to a test stage or keep it for tests only; `FROM debian:bookworm-slim@sha256:<digest>` (pin by digest, not per-package versions, so security point releases still apply). ~400–500 MB saved. | S |
+| D2 | Compose `healthcheck.start_period: 20s` is shorter than `STARTUP_GRACE_SEC=25`; `/health` can now return 503. | `start_period: 60s`. | S |
+
+## E. Integration code hygiene (low)
+
+| # | Item | Proposed change |
+|---|------|-----------------|
+| E1 | `download_clip` takes a free-form `folder`; `_prune` deletes every `*.mp4` older than `keep_days` under the save folder (a save folder of `/media` would prune unrelated files). | Constrain under the media root with `os.path.commonpath`; prune only files matching the bridge's own `^\d{8}_\d{6}_.*\.mp4$`. |
+| E2 | `clips.py` remux `-protocol_whitelist` includes `file`; `api.py._find_url` takes the first http(s) URL anywhere in the JSON. | Drop `file`; read the known field once the response shape is confirmed. |
+| E3 | `TelusAuthError`/`TelusApiError` embed full response bodies in exceptions that are logged at WARNING. | Log `list(data)` / `text[:200]`. |
+| E4 | `camera.py:3` docstring says `kvs_bridge/` (directory is `gst_bridge/`). | Fix the path. |
+
+## Ruled out (checked)
+
+- TLS verification is not bypassed anywhere (websocket-client defaults, boto3 default verify, HA's shared session).
+- No credentials in bridge logs or `/health`; signed WSS URL and TURN URIs are never logged.
+- Hard-coded vendor gateway key / client id / User-Agent are the mobile app's public values, not operator secrets.
+- Frigate's `connection_quality: unusable` on 2026-11-12 came from HA restarts and bridge redeploys, not bridge stalls.

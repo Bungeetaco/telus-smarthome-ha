@@ -7,6 +7,60 @@ breaking changes between minor versions until the API surface stabilizes.
 ## [Unreleased]
 
 ### Fixed (gst_bridge)
+- **Review follow-up (same day): defects found by four independent code reviews.**
+  Full list with evidence in `docs/BACKLOG.md`; applied here:
+  - The stale clock started at the Unix epoch: `started` was set at pad-added
+    while `last_sample_ts` was still 0, so a freshly linked session was judged
+    stale on the watchdog's next 3 s tick (`stale (no frames 1794449565.4s)` in
+    the logs) and burned a reconnect attempt before its first keyframe. The
+    clock now starts at pad-added.
+  - A `/start` that reused a healthy or connecting session discarded the fresh
+    credentials HA had just fetched; auto-reconnects then ran on the original,
+    expiring ones (`ExpiredTokenException`). The reuse path now swaps in the
+    new live config and resets the attempt counter.
+  - `_write_pipe` used `select()`, which raises for any fd >= 1024 (reachable
+    since nofile was raised to 65536) and would have truncated every keyframe
+    silently while P-frames kept the heartbeat alive; now `poll()`. Pipes are
+    grown to 1 MiB (`PIPE_BUFFER_BYTES`) so a 115 KB keyframe is one write,
+    and the video write bound is 0.5 s (`PIPE_WRITE_TIMEOUT_SEC`) so a stalled
+    ffmpeg cannot back-pressure the jitterbuffer for long.
+  - After any dropped or partial video write the stream is corrupt until the
+    next keyframe; delta frames are now skipped until an IDR arrives instead
+    of being forwarded as smear.
+  - Pipe writes and `_kill_ffmpeg`'s pipe closes are serialised per pipe so a
+    write in flight can never land on a reused fd number.
+  - The watchdog never healed a session that never produced a frame (signaling
+    or ffmpeg failure) or whose thread had exited; both are now treated as
+    stale. A GStreamer bus `message::error` ends the session's GLib loop.
+    Giving up after `MAX_AUTO_RECONNECTS` is logged once at WARNING.
+  - `stop()` racing `loop.run()` could lose the quit; the quit is also
+    scheduled as an idle source. `_teardown` closes the signaling websocket,
+    removes the bus watch and drops the webrtcbin reference so libnice sockets
+    are freed immediately (fd count after a reconnect now equals a fresh start).
+  - `STOP_TIMEOUT_SEC` is never below the kill path's worst case (grace + 3 s).
+  - `/start` validates `device_id` (`[A-Za-z0-9_.:-]{1,64}`) and the live
+    config BEFORE stopping the running session (a malformed body used to leave
+    the camera with nothing to heal and then 500); caps concurrent sessions
+    (`MAX_SESSIONS`, 8) with 429; waits on an Event instead of polling.
+    `/stop` takes the sessions lock. Popen failure in `_on_pad` closes its pipes.
+    A second video pad or a pad after `stop()` no longer spawns an untracked ffmpeg.
+  - Logs: timestamps on every line, ffmpeg stderr relayed with the device id
+    and pid, the 30 s `/health` access-log lines filtered out.
+  - `/health`: `degraded` + `reasons`, `version`, `watchdog_age_s`, per-session
+    `reconnects_total`, `gave_up`, `nack_negotiated`, `audio_fallback`;
+    returns 503 only for process sickness a restart cures (watchdog thread
+    silent, session wedged > 5 min), never for a camera outage.
+  - `BRIDGE_HOST` (default unchanged, 0.0.0.0) to bind the control API to
+    loopback; startup warning when `RTSP_READ_BASE` is loopback-only.
+  - Image stamped with the git revision (`GIT_SHA` build arg → `BRIDGE_VERSION`
+    in logs and `/health`).
+  - Tests: `gst_bridge/tests/test_bridge.py` (stdlib unittest, runs inside the
+    image) covers pipe-write bounds incl. fd >= 1024, ffmpeg kill paths, the
+    audio writer on a full pipe, the reaper, IDR-wait after a drop, the exact
+    production video chain against a synthetic 30 fps RTP source, live-config
+    parsing/signing and device-id validation.
+  - Tried and reverted: `-use_wallclock_as_timestamps` for the video input.
+    The fixed-19-fps timestamp problem is documented in `docs/BACKLOG.md` B1.
 - **Frigate recordings of the doorbell were full of artifacting (smeared, blocky
   frames and multi-second freezes).** Two causes, both in the bridge:
   1. *Leaked sessions.* Every stale-session restart left the previous ffmpeg

@@ -194,9 +194,22 @@ Built through API reverse-engineering of the TELUS SmartHome+ app. TELUS SmartHo
 | `WEBRTC_NACK` | `1` | Negotiate RTCP NACK on the video transceiver so lost RTP packets are retransmitted (the camera supports `nack` and `nack pli`). `0` disables. |
 | `WEBRTC_JITTER_MS` | `300` | webrtcbin jitterbuffer depth; must cover one retransmission round trip for NACK to help. |
 | `FFMPEG_KILL_GRACE_SEC` | `3` | After closing ffmpeg's pipes and sending SIGTERM, wait this long before SIGKILL. |
-| `PIPE_WRITE_TIMEOUT_SEC` | `2` | A video write into ffmpeg that does not finish within this time is dropped (ffmpeg stopped reading) instead of blocking the pipeline. |
+| `PIPE_WRITE_TIMEOUT_SEC` | `0.5` | A video write into ffmpeg that does not finish within this time is dropped (ffmpeg stopped reading) instead of blocking the pipeline; delta frames are then skipped until the next keyframe. |
+| `PIPE_BUFFER_BYTES` | `1048576` | Pipe capacity requested with `F_SETPIPE_SZ` so one keyframe is a single write. |
+| `BRIDGE_HOST` | `0.0.0.0` | Bind address of the control API. Use `127.0.0.1` when Home Assistant runs on the same host. |
+| `MAX_SESSIONS` | `8` | Concurrent sessions accepted before `/start` answers 429. |
 | `STREAM_STALE_SEC` / `STARTUP_GRACE_SEC` / `MAX_AUTO_RECONNECTS` / `STOP_TIMEOUT_SEC` | `8` / `25` / `6` / `5` | Self-healing watchdog (see comments in `telus_gst_bridge.py`). |
 
-`GET /health` includes a `process` block (`fds`, `threads`, `ffmpeg_children`,
-`session_objects`, `wedged_sessions`): more than one ffmpeg child, or fds
-climbing session after session, means a leak.
+`GET /health` returns `ok`, `degraded` + `reasons`, `version` (git revision the
+image was built from), per-session `healthy / secs_since_frame /
+reconnect_attempts / reconnects_total / gave_up / nack_negotiated /
+audio_fallback / video_drops / audio_drops`, and a `process` block (`fds`,
+`threads`, `ffmpeg_children`, `session_objects`, `wedged_sessions`,
+`watchdog_age_s`). More than one ffmpeg child per camera, or fds climbing
+session after session, means a leak. HTTP 503 means the service itself is sick
+(watchdog thread silent, a session wedged in teardown for > 5 min) and a
+container restart is the right response; a camera outage shows as
+`degraded: true` with HTTP 200 and must not restart the bridge. Build with
+`GIT_SHA=$(git rev-parse --short HEAD) docker compose up -d --build` so the
+version is stamped. Tests: see `gst_bridge/tests/test_bridge.py` (run inside
+the image). Open items from the 2026-11-12 reviews: `docs/BACKLOG.md`.

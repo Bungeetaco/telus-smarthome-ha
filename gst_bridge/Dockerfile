@@ -6,6 +6,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       gstreamer1.0-nice gir1.2-gst-plugins-bad-1.0 \
       ffmpeg ca-certificates \
  && rm -rf /var/lib/apt/lists/*
+# Stamped by compose (GIT_SHA build arg) so logs and /health say which commit
+# runs; "unknown" when built by hand without it.
+ARG GIT_SHA=unknown
+ENV BRIDGE_VERSION=$GIT_SHA
+LABEL org.opencontainers.image.revision=$GIT_SHA
 WORKDIR /app
 COPY telus_gst_bridge.py .
 EXPOSE 8787

@@ -21,7 +21,11 @@ services:
         max-file: "3"
 
   bridge:
-    build: .
+    build:
+      context: .
+      args:
+        # GIT_SHA=$(git rev-parse --short HEAD) docker compose up -d --build
+        GIT_SHA: "${GIT_SHA:-unknown}"
     restart: unless-stopped
     network_mode: host
     init: true                 # reaps the ffmpeg child processes cleanly
