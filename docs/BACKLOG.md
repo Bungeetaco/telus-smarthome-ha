@@ -94,11 +94,10 @@ one host (10.13.38.2) that sits on the IoT VLAN.
   with 60-2000 ms RTT on the LAN; cloud connectivity flipping every 30-60 s;
   Wi-Fi RSSI (-61) and temperature (46 C) last reported 05:14Z. The living
   room camera (other bridge) was fine throughout: not a host/network issue.
-- Likely causes, in order: camera Wi-Fi link collapsed (AP/channel/interference)
-  or the camera is in a low-power/low-battery mode that refuses live view; the
-  integration never saw a battery resource, so battery level is unknown.
-  Check the TELUS app for battery and Wi-Fi, power-cycle the doorbell.
-- Open question: Frigate's 24/7 demand keeps the camera streaming almost
-  continuously (108 min sessions now that NACK keeps them alive). If the
-  doorbell is battery powered this is a battery-life trade-off worth deciding
-  deliberately (e.g. record on motion only).
+- Resolution: the doorbell is MAINS powered (owner), so not a battery issue.
+  A power cycle at ~15:17Z brought it back: pings 5 ms / 0 % loss, session up
+  at 15:19:03Z, Frigate at 5 fps by 15:20Z. Cause was the camera's Wi-Fi link
+  (RSSI -61 dBm at its last report, 1-2 s LAN round trips while degraded). If
+  it repeats: check the access point it joins, channel/interference, doorbell
+  firmware. Recovery after the camera returns takes up to RESTART_BACKOFF_SEC
+  (120 s) because the bridge had given up.
