@@ -78,6 +78,12 @@ STREAM_STALE_SEC = float(os.environ.get("STREAM_STALE_SEC", "8"))    # no frames
 STARTUP_GRACE_SEC = float(os.environ.get("STARTUP_GRACE_SEC", "25"))  # handshake window
 WATCHDOG_INTERVAL_SEC = float(os.environ.get("WATCHDOG_INTERVAL_SEC", "3"))
 MAX_AUTO_RECONNECTS = int(os.environ.get("MAX_AUTO_RECONNECTS", "6"))  # before waiting for HA
+# Once the bridge has given up on a camera (MAX_AUTO_RECONNECTS failed, e.g. the
+# camera is off Wi-Fi), a fresh attempt is made at most this often even though
+# Home Assistant keeps asking every minute. Before 2026-11-12 the reuse path
+# reset the attempt counter on every HA /start, so a dead doorbell was dialled
+# every 27 s all morning (806 offers in 6 h); each attempt wakes the camera.
+RESTART_BACKOFF_SEC = float(os.environ.get("RESTART_BACKOFF_SEC", "120"))
 # ffmpeg child shutdown: its stdin pipes are closed first (EOF makes it finish
 # on its own), then SIGTERM, then SIGKILL after this grace. Before 2026-11-12 the
 # bridge only sent SIGTERM and never closed the pipes; ffmpeg 5.1 blocked in
@@ -992,10 +998,11 @@ def _stop_session(sess: GstSession, timeout: float = STOP_TIMEOUT_SEC) -> None:
                      sess.device_id, timeout)
 
 
-def _spawn_session(device_id, cfg, pub, read_url, attempts=0) -> GstSession:
+def _spawn_session(device_id, cfg, pub, read_url, attempts=0, audio=None) -> GstSession:
     # Audio only on fresh/early sessions; after repeated failures fall back to
-    # video-only so audio can never keep video from coming up.
-    use_audio = ENABLE_AUDIO and attempts < AUDIO_FALLBACK_AFTER
+    # video-only so audio can never keep video from coming up. `audio` forces
+    # the choice (an HA-initiated retry after give-up is not an audio problem).
+    use_audio = ENABLE_AUDIO and (attempts < AUDIO_FALLBACK_AFTER if audio is None else audio)
     if ENABLE_AUDIO and not use_audio:
         _LOG.info("[%s] audio disabled for this attempt (fallback to video-only)",
                   device_id)
@@ -1029,23 +1036,33 @@ async def handle_start(request: web.Request) -> web.Response:
     # stale (camera dropped it) is NOT reused -- we restart it below with the
     # fresh credentials HA just sent. This is what fixes "works sometimes" and
     # "have to reload every ~10 min".
+    spawn_attempts = 0
     with SESSIONS_LOCK:
         existing = SESSIONS.get(device_id)
-        if (
-            existing
-            and existing._thread.is_alive()
-            and (existing.is_healthy() or existing.is_connecting())
-        ):
-            # Keep the session, but take HA's fresh credentials: the watchdog's
-            # auto-reconnects use `cfg`, and until 2026-11-12 they kept the
-            # original (expiring) creds while every refresh HA sent was thrown
-            # away -- the ExpiredTokenException reconnect failures in the log.
+        if existing and existing._thread.is_alive():
+            # Always take HA's fresh credentials: the watchdog's auto-reconnects
+            # use `cfg`, and until 2026-11-12 they kept the original (expiring)
+            # creds while every refresh HA sent was thrown away.
             existing.cfg = cfg
-            existing.reconnect_attempts = 0
-            _LOG.info("[%s] start: reusing %s session, credentials refreshed",
-                      device_id, "healthy" if existing.is_healthy() else "connecting")
-            return web.json_response({"rtsp_url": read_url, "reused": True,
-                                      "started": existing.started})
+            if existing.is_healthy():
+                existing.reconnect_attempts = 0  # flowing: a clean slate
+                _LOG.info("[%s] start: reusing healthy session, credentials refreshed", device_id)
+                return web.json_response({"rtsp_url": read_url, "reused": True, "started": True})
+            if existing.is_connecting():
+                # Still in its handshake grace; the attempt counter is NOT
+                # reset here (that made a dead camera retry forever).
+                _LOG.info("[%s] start: reusing connecting session, credentials refreshed", device_id)
+                return web.json_response({"rtsp_url": read_url, "reused": True, "started": False})
+            if existing.reconnect_attempts >= MAX_AUTO_RECONNECTS:
+                age = time.time() - existing.created_ts
+                if age < RESTART_BACKOFF_SEC:
+                    _LOG.info("[%s] start: gave up %.0fs ago; next attempt in %.0fs",
+                              device_id, age, RESTART_BACKOFF_SEC - age)
+                    return web.json_response({"rtsp_url": read_url, "reused": True,
+                                              "started": False, "backoff": True})
+                # One HA-initiated attempt per backoff period; it inherits the
+                # give-up state so the watchdog does not add six more.
+                spawn_attempts = MAX_AUTO_RECONNECTS
         if existing is None and len(SESSIONS) >= MAX_SESSIONS:
             return web.json_response({"error": "too many sessions"}, status=429)
         old = SESSIONS.pop(device_id, None)
@@ -1055,7 +1072,10 @@ async def handle_start(request: web.Request) -> web.Response:
         await asyncio.get_running_loop().run_in_executor(None, _stop_session, old)
 
     with SESSIONS_LOCK:
-        sess = _spawn_session(device_id, cfg, pub, read_url, attempts=0)
+        sess = _spawn_session(device_id, cfg, pub, read_url, attempts=spawn_attempts,
+                              audio=True if spawn_attempts else None)
+        if old is not None:
+            sess.reconnects_total = old.reconnects_total
     # Wait (off the event loop) until the video pad is linked, at most 12 s.
     await asyncio.get_running_loop().run_in_executor(None, sess.started_evt.wait, 12)
     _LOG.info("[%s] start returned (started=%s)", device_id, sess.started)
