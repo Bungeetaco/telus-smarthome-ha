@@ -156,6 +156,54 @@ class MediaChain(unittest.TestCase):
         self.assertIn("mux.audio_0", b.build_chain(7, True))
 
 
+class Pll(unittest.TestCase):
+    """Bursty arrivals (as measured on the wire) in, smooth monotonic clock out."""
+
+    def _run(self, fps, burst, pause_ms, seconds, jitter_ms=0):
+        import random
+        rnd = random.Random(1)
+        pll = b._Pll(33_000_000, window=60)
+        T = 1e9 / fps
+        out, arr = [], []
+        t = 0.0
+        n = 0
+        while t < seconds * 1e9:
+            # `burst` frames captured one interval apart are delivered together
+            base = t + pause_ms * 1e6
+            for i in range(burst):
+                a = int(base + rnd.uniform(0, jitter_ms) * 1e6)
+                arr.append(a); out.append(pll.update(a)); n += 1
+            t += burst * T
+        return arr, out, T
+
+    def test_smooth_and_tracking(self):
+        arr, out, T = self._run(fps=27, burst=5, pause_ms=150, seconds=20, jitter_ms=2)
+        d = [y - x for x, y in zip(out, out[1:])]
+        self.assertTrue(all(x > 0 for x in d), "not monotonic")
+        steady = d[200:]  # after lock-in
+        bad = [x for x in steady if abs(x - T) > 0.35 * T]
+        self.assertLess(len(bad) / len(steady), 0.05, f"spacing off in {len(bad)}/{len(steady)}: {bad[:5]}")
+        # long-term: output clock tracks real time within the burst length
+        self.assertLess(abs(out[-1] - arr[-1]), 0.4e9, (out[-1] - arr[-1]) / 1e9)
+        self.assertAlmostEqual((out[-1] - out[200]) / (len(out) - 201), T, delta=0.03 * T)
+
+    def test_rate_change_and_stall(self):
+        pll = b._Pll(33_000_000, window=60)
+        t = 0; outs = []
+        for _ in range(300):              # 30 fps, smooth
+            t += 33_333_333; outs.append(pll.update(t))
+        t += 2_000_000_000               # 2 s stall, then a burst of the backlog
+        for _ in range(60):
+            t += 1000; outs.append(pll.update(t))
+        for _ in range(600):             # then 15 fps
+            t += 66_666_667; outs.append(pll.update(t))
+        d = [y - x for x, y in zip(outs, outs[1:])]
+        self.assertTrue(all(x > 0 for x in d))
+        self.assertLess(abs(outs[-1] - t), 0.5e9, "did not re-lock after the stall")
+        tail = d[-100:]
+        self.assertTrue(all(abs(x - 66_666_667) < 0.35 * 66_666_667 for x in tail), tail[:5])
+
+
 class LiveConfig(unittest.TestCase):
     PAYLOAD = {"liveConfig": {"data": {
         "channelArn": "arn:aws:kinesisvideo:ca-central-1:1:channel/x/1",

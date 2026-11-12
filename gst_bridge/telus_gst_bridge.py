@@ -206,6 +206,18 @@ _ALL_SESSIONS_LOCK = threading.Lock()
 # request-keyframe: a PLI goes back to the camera when the depayloader sees RTP
 # loss; wait-for-keyframe: the rest of that GOP is dropped rather than forwarded
 # smeared (needs AU alignment, hence the capsfilter right after the depayloader).
+# Timestamps: this camera's RTP clock is frame-count based at its nominal
+# 19 fps (like its SPS VUI) while it really captures 14-30 fps, so RTP time
+# runs up to 1.4x real time. rtpjitterbuffer (slave mode) paces output to that
+# clock and re-syncs every few seconds (forward bursts, backward jumps,
+# "Non-monotonous DTS" in ffmpeg). The only honest timebase is packet ARRIVAL:
+# a probe on each jitterbuffer's sink pad records the running time per RTP
+# sequence number and a probe on its src pad writes it back as the packet PTS,
+# so the depayloaders stamp every access unit with when its first packet
+# arrived (retransmitted packets excepted; a per-track monotonic clamp covers
+# that). Delivery is still bursty (the jitterbuffer's pacing), the timestamps
+# are not.
+#
 # The per-branch leaky queues isolate the camera from a stalled ffmpeg: fdsink
 # blocks when the pipe is full, the queues then drop upstream instead of
 # back-pressuring the jitterbuffer, and the heartbeat (a probe on fdsink's
@@ -214,12 +226,12 @@ VIDEO_BRANCH = (
     "rtph264depay name=vdepay request-keyframe=true wait-for-keyframe=true ! "
     "video/x-h264,alignment=au ! h264parse ! "
     "video/x-h264,stream-format=avc,alignment=au ! "
-    "queue name=vq leaky=downstream max-size-time=2000000000 max-size-buffers=0 max-size-bytes=0 ! "
+    "queue name=vq leaky=downstream max-size-time=5000000000 max-size-buffers=0 max-size-bytes=0 ! "
     "mux.video_0"
 )
 AUDIO_BRANCH = (
     "rtpopusdepay name=adepay ! opusparse ! "
-    "queue name=aq leaky=downstream max-size-time=2000000000 max-size-buffers=0 max-size-bytes=0 ! "
+    "queue name=aq leaky=downstream max-size-time=5000000000 max-size-buffers=0 max-size-bytes=0 ! "
     "mux.audio_0"
 )
 MUX_CHAIN = "matroskamux name=mux streamable=true ! fdsink name=out sync=false fd=%d"
@@ -231,6 +243,72 @@ def build_chain(fd: int, audio: bool) -> str:
     if audio:
         desc += " " + AUDIO_BRANCH
     return desc
+
+
+class _Pll:
+    """Smooth, monotonic presentation clock from bursty arrival times.
+
+    The doorbell captures at a steady rate (14-30 fps) but transmits over Wi-Fi
+    in bursts: several frames within 2 ms, then 200-500 ms of nothing (measured
+    on the wire 2026-11-12). Its RTP timestamps are frame-count based at a fixed
+    nominal rate, so they cannot be used either. This tracker outputs
+    pts_n = pts_{n-1} + T, where T is the mean arrival interval over the last
+    `window` frames (bursts average out over ~2 s), and pulls the clock toward
+    the arrival time with gain `k` so it can never drift away from real time.
+    """
+
+    def __init__(self, default_interval_ns: int, window: int = 60, k: float = 0.05,
+                 max_lead_ns: int = 1_000_000_000):
+        self.default = default_interval_ns
+        self.window = window
+        self.k = k
+        self.max_lead = max_lead_ns
+        self.arrivals: list[int] = []
+        self.pts: int | None = None
+
+    def update(self, arrival_ns: int) -> int:
+        self.arrivals.append(arrival_ns)
+        if len(self.arrivals) > self.window:
+            del self.arrivals[0]
+        if self.pts is None:
+            self.pts = arrival_ns
+            return self.pts
+        if len(self.arrivals) >= 2:
+            span = self.arrivals[-1] - self.arrivals[0]
+            interval = span // (len(self.arrivals) - 1) if span > 0 else self.default
+        else:
+            interval = self.default
+        pts = self.pts + interval
+        pts += int(self.k * (arrival_ns - pts))          # slow pull toward real time
+        pts = max(pts, self.pts + max(interval // 4, 1_000_000))  # monotonic, >= 1 ms
+        if pts > arrival_ns + self.max_lead:             # never run far ahead of reality
+            pts = arrival_ns + self.max_lead
+        self.pts = pts
+        return pts
+
+
+class _Hist:
+    """Inter-arrival histogram (ms buckets) + max gap, for /health diagnostics."""
+    BUCKETS = ((2, "<2ms"), (20, "2-20ms"), (100, "20-100ms"), (500, "100-500ms"), (10**9, ">500ms"))
+
+    def __init__(self):
+        self.last = None
+        self.counts = {name: 0 for _, name in self.BUCKETS}
+        self.max_gap_ms = 0.0
+
+    def tick(self, now_ns: int) -> None:
+        if self.last is not None:
+            gap_ms = (now_ns - self.last) / 1e6
+            if gap_ms > self.max_gap_ms:
+                self.max_gap_ms = gap_ms
+            for limit, name in self.BUCKETS:
+                if gap_ms < limit:
+                    self.counts[name] += 1
+                    break
+        self.last = now_ns
+
+    def as_dict(self) -> dict:
+        return {**self.counts, "max_gap_ms": round(self.max_gap_ms, 1)}
 
 
 def _grow_pipe(fd: int) -> None:
@@ -268,6 +346,14 @@ class GstSession:
         # threads at the same time; building the chain and linking must not
         # interleave (the second handler once saw chain_built with no chain).
         self._pad_lock = threading.Lock()
+        self._arrival: dict[int, dict[int, int]] = {}   # ssrc -> {seq: arrival running time (ns)}
+        self._pll = {"video": _Pll(33_000_000, window=60),       # ~2 s at 30 fps
+                     "audio": _Pll(20_000_000, window=100)}      # 2 s of 20 ms Opus frames
+        self._restamped = 0
+        self._unstamped = 0                              # packets whose arrival was unknown
+        # Diagnostics: inter-arrival histograms at two points (see /health).
+        self._hist = {"nicesrc": _Hist(), "jb_in": _Hist()}
+        self._nicesrc_probed = False
         self.device_id = device_id
         self.cfg = cfg
         self.publish_url = publish_url
@@ -430,6 +516,12 @@ class GstSession:
             self.pipe.add(self.webrtc)
             for t in turns:
                 self.webrtc.emit("add-turn-server", t)
+            rtpbin = self.webrtc.get_by_name("rtpbin")
+            if rtpbin is not None:
+                rtpbin.connect("new-jitterbuffer", self._on_new_jitterbuffer)
+            else:
+                _LOG.warning("[%s] webrtcbin has no 'rtpbin' child; arrival-time "
+                             "stamping disabled (timestamps follow the camera clock)", dev)
 
             # recvonly video+audio transceivers
             caps_v = Gst.Caps.from_string(
@@ -714,12 +806,12 @@ class GstSession:
         # actually gets; buffers leaving the branch queues count per track.
         chain.get_by_name("out").get_static_pad("sink").add_probe(
             Gst.PadProbeType.BUFFER, self._on_out_buffer, None)
-        chain.get_by_name("vq").get_static_pad("src").add_probe(
-            Gst.PadProbeType.BUFFER, self._on_video_buffer, None)
+        chain.get_by_name("vdepay").get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, self._on_au, "video")
         chain.get_by_name("vq").connect("overrun", self._on_video_overrun)
         if self.audio:
-            chain.get_by_name("aq").get_static_pad("src").add_probe(
-                Gst.PadProbeType.BUFFER, self._on_audio_buffer, None)
+            chain.get_by_name("adepay").get_static_pad("src").add_probe(
+                Gst.PadProbeType.BUFFER, self._on_au, "audio")
             chain.get_by_name("aq").connect("overrun", self._on_audio_overrun)
         chain.sync_state_with_parent()
         _LOG.info("[%s] publishing via ffmpeg pid %d (audio=%s) -> %s",
@@ -730,13 +822,96 @@ class GstSession:
         self.last_sample_ts = time.time()  # heartbeat: data is reaching ffmpeg
         return Gst.PadProbeReturn.OK
 
-    def _on_video_buffer(self, pad, info, _):
-        self.video_bytes += info.get_buffer().get_size()
+    # ---- arrival-time stamping (see the comment above VIDEO_BRANCH) ----
+    def _running_time(self) -> int:
+        clock = self.pipe.get_clock()
+        if clock is None:
+            return Gst.CLOCK_TIME_NONE
+        return clock.get_time() - self.pipe.get_base_time()
+
+    def _on_new_jitterbuffer(self, rtpbin, jb, session, ssrc):
+        self._arrival[ssrc] = {}
+        self._probe_nicesrc_once()
+        jb.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._on_rtp_in, ssrc)
+        jb.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, self._on_rtp_out, ssrc)
+        _LOG.info("[%s] jitterbuffer for ssrc %u: arrival-time stamping on", self.device_id, ssrc)
+
+    @staticmethod
+    def _rtp_seq(buf) -> int | None:
+        ok, m = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return None
+        try:
+            if m.size < 4:
+                return None
+            d = m.data
+            return (d[2] << 8) | d[3]
+        finally:
+            buf.unmap(m)
+
+    def _probe_nicesrc_once(self) -> None:
+        """Find webrtcbin's nicesrc element(s) and histogram their output."""
+        if self._nicesrc_probed or self.webrtc is None:
+            return
+        self._nicesrc_probed = True
+        it = self.webrtc.iterate_recurse()
+        while True:
+            res, elem = it.next()
+            if res == Gst.IteratorResult.DONE:
+                break
+            if res != Gst.IteratorResult.OK:
+                continue
+            if elem.get_factory() and elem.get_factory().get_name() == "nicesrc":
+                pad = elem.get_static_pad("src")
+                if pad is not None:
+                    pad.add_probe(Gst.PadProbeType.BUFFER | Gst.PadProbeType.BUFFER_LIST,
+                                  self._on_nicesrc_buf, None)
+                    _LOG.info("[%s] diagnostics probe on %s", self.device_id, elem.get_name())
+
+    def _on_nicesrc_buf(self, pad, info, _):
+        self._hist["nicesrc"].tick(self._running_time())
         return Gst.PadProbeReturn.OK
 
-    def _on_audio_buffer(self, pad, info, _):
-        self.audio_bytes += info.get_buffer().get_size()
-        self.audio_active = True
+    def _on_rtp_in(self, pad, info, ssrc):
+        now = self._running_time()
+        self._hist["jb_in"].tick(now)
+        seq = self._rtp_seq(info.get_buffer())
+        if seq is not None:
+            table = self._arrival.get(ssrc)
+            if table is not None:
+                if len(table) > 4096:  # packets that never came out (lost for good)
+                    table.clear()
+                table.setdefault(seq, now)  # first arrival wins (RTX later)
+        return Gst.PadProbeReturn.OK
+
+    def _on_rtp_out(self, pad, info, ssrc):
+        buf = info.get_buffer()
+        seq = self._rtp_seq(buf)
+        table = self._arrival.get(ssrc)
+        arrival = table.pop(seq, None) if (seq is not None and table is not None) else None
+        if arrival is not None and arrival != Gst.CLOCK_TIME_NONE:
+            buf.pts = arrival
+            buf.dts = arrival
+            self._restamped += 1
+        else:
+            self._unstamped += 1
+        return Gst.PadProbeReturn.OK
+
+    def _on_au(self, pad, info, kind):
+        """Per track: count bytes and replace the (arrival-time) PTS with the
+        smoothed, monotonic clock from _Pll."""
+        buf = info.get_buffer()
+        pts = buf.pts
+        if pts != Gst.CLOCK_TIME_NONE:
+            smooth = self._pll[kind].update(pts)
+            buf.pts = smooth
+            buf.dts = smooth
+        size = buf.get_size()
+        if kind == "video":
+            self.video_bytes += size
+        else:
+            self.audio_bytes += size
+            self.audio_active = True
         return Gst.PadProbeReturn.OK
 
     def _on_video_overrun(self, queue):
@@ -1013,6 +1188,9 @@ async def handle_health(request: web.Request) -> web.Response:
             "audio_active": s.audio_active,
             "audio_bytes": s.audio_bytes,
             "video_bytes": s.video_bytes,
+            "rtp_restamped": s._restamped,
+            "rtp_unstamped": s._unstamped,
+            "arrival_hist": {k: h.as_dict() for k, h in s._hist.items()},
             "video_drops": s.video_drops,
             "audio_drops": s.audio_drops,
         }

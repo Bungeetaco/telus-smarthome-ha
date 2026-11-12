@@ -245,6 +245,7 @@ loopback-only.
 | `WEBRTC_JITTER_MS` | `300` | webrtcbin jitterbuffer depth; must cover one retransmission round trip for NACK to help. |
 | `FFMPEG_KILL_GRACE_SEC` | `3` | After closing ffmpeg's pipes and sending SIGTERM, wait this long before SIGKILL. |
 | `PAD_SETTLE_MS` | `1500` | How long the Matroska muxer waits for the camera's audio pad after the first pad before publishing video-only. |
+| (timing) | built in | RTP packets are re-stamped with their arrival time and each track runs through a smoothing clock (`_Pll`, ~2 s window); `/health` shows `rtp_restamped`, `rtp_unstamped` and `arrival_hist`. The camera's own RTP clock is frame-count based and its Wi-Fi delivery bursty, see `docs/BACKLOG.md`. |
 | `PIPE_BUFFER_BYTES` | `1048576` | Capacity of ffmpeg's stdin pipe (`F_SETPIPE_SZ`) so `fdsink` hands a whole cluster over in one write. |
 | `BRIDGE_HOST` | `0.0.0.0` | Bind address of the control API. Use `127.0.0.1` when Home Assistant runs on the same host. |
 | `MAX_SESSIONS` | `8` | Concurrent sessions accepted before `/start` answers 429. |

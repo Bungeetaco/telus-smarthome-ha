@@ -38,6 +38,29 @@ breaking changes between minor versions until the API surface stabilizes.
   on the AAC output once the real timestamps were carried through.
 - Teardown clears the chain and pad references too (fd count after a
   reconnect is identical to a fresh start again).
+- **Arrival-time stamping + smoothing clock.** With real timestamps carried
+  through, the camera's own clock turned out to be unusable: its RTP
+  timestamps are frame-count based at a nominal 19 fps (like its SPS VUI) while
+  it captures 14-30 fps, so RTP time runs up to 1.4x real time; rtpjitterbuffer
+  (slave mode) paces to that clock and re-syncs every few seconds (forward
+  bursts, backward jumps, a "Non-monotonous DTS" every ~3 s). And on the wire
+  (tcpdump of the doorbell's own UDP flow) the camera transmits in bursts over
+  Wi-Fi: several frames within 2 ms, then 200-500 ms of silence, while
+  capturing steadily. The bridge therefore (1) records each RTP packet's
+  arrival running time at the jitterbuffer's sink pad and writes it back as
+  the packet PTS at its src pad (keyed by sequence number, first arrival wins
+  so retransmissions do not count), and (2) per track replaces that bursty
+  arrival time with a phase-locked clock (`_Pll`): constant spacing equal to the
+  mean arrival interval over the last ~2 s, pulled toward arrival with gain
+  0.05 so it never drifts, monotonic by construction. Measured on the published
+  stream: 19.3 PTS-seconds read in 19.5 wall-seconds, video spacing 20-50 ms
+  (median 33 ms), audio exactly 20 ms, zero ffmpeg timestamp warnings, zero
+  queue drops. `/health` gains `rtp_restamped` / `rtp_unstamped` and
+  `arrival_hist` (inter-arrival histograms at nicesrc and at the jitterbuffer
+  input, the diagnostics that located the burstiness). Per-track queues hold
+  5 s so ffmpeg's start-up no longer costs frames. Tests: `Pll` runs the clock
+  on synthetic bursty arrivals (5 frames per 185 ms burst, a 2 s stall, a rate
+  change) and asserts monotonicity, spacing and long-term tracking.
 - Tests: `MediaChain` runs the exact production chain against synthetic 30 fps
   H.264 + Opus RTP sources into a file via fdsink and asserts 1/30 s PTS
   spacing and A/V alignment on the Matroska output and on ffmpeg's remux of it
