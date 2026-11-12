@@ -162,7 +162,7 @@ class Pll(unittest.TestCase):
     def _run(self, fps, burst, pause_ms, seconds, jitter_ms=0):
         import random
         rnd = random.Random(1)
-        pll = b._Pll(33_000_000, window=60)
+        pll = b._Pll(33_000_000)
         T = 1e9 / fps
         out, arr = [], []
         t = 0.0
@@ -188,7 +188,7 @@ class Pll(unittest.TestCase):
         self.assertAlmostEqual((out[-1] - out[200]) / (len(out) - 201), T, delta=0.03 * T)
 
     def test_rate_change_and_stall(self):
-        pll = b._Pll(33_000_000, window=60)
+        pll = b._Pll(33_000_000)
         t = 0; outs = []
         for _ in range(300):              # 30 fps, smooth
             t += 33_333_333; outs.append(pll.update(t))
@@ -200,6 +200,9 @@ class Pll(unittest.TestCase):
         d = [y - x for x, y in zip(outs, outs[1:])]
         self.assertTrue(all(x > 0 for x in d))
         self.assertLess(abs(outs[-1] - t), 0.5e9, "did not re-lock after the stall")
+        # the backlog burst after the stall must not be squeezed into a few ms
+        burst = d[300:360]
+        self.assertTrue(all(x >= 11_000_000 for x in burst), min(burst))
         tail = d[-100:]
         self.assertTrue(all(abs(x - 66_666_667) < 0.35 * 66_666_667 for x in tail), tail[:5])
 

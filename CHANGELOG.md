@@ -51,8 +51,12 @@ breaking changes between minor versions until the API surface stabilizes.
   the packet PTS at its src pad (keyed by sequence number, first arrival wins
   so retransmissions do not count), and (2) per track replaces that bursty
   arrival time with a phase-locked clock (`_Pll`): constant spacing equal to the
-  mean arrival interval over the last ~2 s, pulled toward arrival with gain
-  0.05 so it never drifts, monotonic by construction. Measured on the published
+  mean arrival interval over the last 3 s of arrivals (time-based, so a
+  post-stall burst of 60 frames cannot collapse it), pulled toward arrival with
+  gain 0.05 so it never drifts, each step floored at a third of the nominal
+  interval (no fast-forward) and capped at 4x (gradual catch-up), monotonic by
+  construction; a buffer that somehow reaches the muxer without a PTS is given
+  the next tick instead of a duplicate timecode (`au_without_pts` in /health). Measured on the published
   stream: 19.3 PTS-seconds read in 19.5 wall-seconds, video spacing 20-50 ms
   (median 33 ms), audio exactly 20 ms, zero ffmpeg timestamp warnings, zero
   queue drops. `/health` gains `rtp_restamped` / `rtp_unstamped` and

@@ -249,18 +249,22 @@ class _Pll:
     """Smooth, monotonic presentation clock from bursty arrival times.
 
     The doorbell captures at a steady rate (14-30 fps) but transmits over Wi-Fi
-    in bursts: several frames within 2 ms, then 200-500 ms of nothing (measured
-    on the wire 2026-11-12). Its RTP timestamps are frame-count based at a fixed
-    nominal rate, so they cannot be used either. This tracker outputs
+    in bursts: several frames within 2 ms, then 200-500 ms of nothing, and
+    after a stall a whole second or two of frames at once (measured on the wire
+    2026-11-12). Its RTP timestamps are frame-count based at a fixed nominal
+    rate, so they cannot be used either. This tracker outputs
     pts_n = pts_{n-1} + T, where T is the mean arrival interval over the last
-    `window` frames (bursts average out over ~2 s), and pulls the clock toward
-    the arrival time with gain `k` so it can never drift away from real time.
+    `window_ns` of arrivals (time-based, so a burst cannot collapse it), pulls
+    the clock toward the arrival time with gain `k` so it never drifts away
+    from real time, floors each step at a third of the nominal interval (no
+    fast-forward after a burst) and caps it at 4 T (catch-up after a stall is
+    gradual, not a jump).
     """
 
-    def __init__(self, default_interval_ns: int, window: int = 60, k: float = 0.05,
-                 max_lead_ns: int = 1_000_000_000):
+    def __init__(self, default_interval_ns: int, window_ns: int = 3_000_000_000,
+                 k: float = 0.05, max_lead_ns: int = 1_000_000_000):
         self.default = default_interval_ns
-        self.window = window
+        self.window_ns = window_ns
         self.k = k
         self.max_lead = max_lead_ns
         self.arrivals: list[int] = []
@@ -268,21 +272,25 @@ class _Pll:
 
     def update(self, arrival_ns: int) -> int:
         self.arrivals.append(arrival_ns)
-        if len(self.arrivals) > self.window:
+        cutoff = arrival_ns - self.window_ns
+        while len(self.arrivals) > 2 and self.arrivals[0] < cutoff:
             del self.arrivals[0]
+        if len(self.arrivals) > 600:            # memory bound at silly rates
+            del self.arrivals[: len(self.arrivals) - 600]
         if self.pts is None:
             self.pts = arrival_ns
             return self.pts
-        if len(self.arrivals) >= 2:
-            span = self.arrivals[-1] - self.arrivals[0]
-            interval = span // (len(self.arrivals) - 1) if span > 0 else self.default
+        span = self.arrivals[-1] - self.arrivals[0]
+        if len(self.arrivals) >= 10 and span > 0:
+            interval = span // (len(self.arrivals) - 1)
         else:
             interval = self.default
-        pts = self.pts + interval
-        pts += int(self.k * (arrival_ns - pts))          # slow pull toward real time
-        pts = max(pts, self.pts + max(interval // 4, 1_000_000))  # monotonic, >= 1 ms
-        if pts > arrival_ns + self.max_lead:             # never run far ahead of reality
-            pts = arrival_ns + self.max_lead
+        step = interval + int(self.k * (arrival_ns - (self.pts + interval)))
+        floor = max(self.default // 3, 1_000_000)
+        step = max(floor, min(step, 4 * interval))
+        pts = self.pts + step
+        if pts > arrival_ns + self.max_lead:     # never run far ahead of reality
+            pts = max(self.pts + floor, arrival_ns + self.max_lead)
         self.pts = pts
         return pts
 
@@ -347,8 +355,8 @@ class GstSession:
         # interleave (the second handler once saw chain_built with no chain).
         self._pad_lock = threading.Lock()
         self._arrival: dict[int, dict[int, int]] = {}   # ssrc -> {seq: arrival running time (ns)}
-        self._pll = {"video": _Pll(33_000_000, window=60),       # ~2 s at 30 fps
-                     "audio": _Pll(20_000_000, window=100)}      # 2 s of 20 ms Opus frames
+        self._pll = {"video": _Pll(33_000_000), "audio": _Pll(20_000_000)}
+        self._au_no_pts = 0
         self._restamped = 0
         self._unstamped = 0                              # packets whose arrival was unknown
         # Diagnostics: inter-arrival histograms at two points (see /health).
@@ -902,10 +910,15 @@ class GstSession:
         smoothed, monotonic clock from _Pll."""
         buf = info.get_buffer()
         pts = buf.pts
-        if pts != Gst.CLOCK_TIME_NONE:
-            smooth = self._pll[kind].update(pts)
-            buf.pts = smooth
-            buf.dts = smooth
+        pll = self._pll[kind]
+        if pts == Gst.CLOCK_TIME_NONE:
+            # Should not happen (every RTP packet is re-stamped); never let an
+            # untimed buffer reach the muxer as a duplicate timecode.
+            self._au_no_pts += 1
+            pts = pll.pts if pll.pts is not None else self._running_time()
+        smooth = pll.update(pts)
+        buf.pts = smooth
+        buf.dts = smooth
         size = buf.get_size()
         if kind == "video":
             self.video_bytes += size
@@ -1190,6 +1203,7 @@ async def handle_health(request: web.Request) -> web.Response:
             "video_bytes": s.video_bytes,
             "rtp_restamped": s._restamped,
             "rtp_unstamped": s._unstamped,
+            "au_without_pts": s._au_no_pts,
             "arrival_hist": {k: h.as_dict() for k, h in s._hist.items()},
             "video_drops": s.video_drops,
             "audio_drops": s.audio_drops,
