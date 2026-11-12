@@ -14,6 +14,7 @@ from .const import (
     CONF_ACCESS_TOKEN,
     CONF_AUTH_DOMAIN,
     CONF_AUTO_SAVE,
+    CONF_BRIDGE_TOKEN,
     CONF_BRIDGE_URL,
     CONF_HOUSEHOLD_ID,
     CONF_KEEP_DAYS,
@@ -73,12 +74,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     bridge_url = entry.options.get(
         CONF_BRIDGE_URL, entry.data.get(CONF_BRIDGE_URL)
     )
+    # Optional shared secret: the bridge refuses /session/* without it when
+    # its BRIDGE_TOKEN is set (its /health stays open).
+    bridge_token = (entry.options.get(CONF_BRIDGE_TOKEN)
+                    or entry.data.get(CONF_BRIDGE_TOKEN) or "")
     # Bridge health is a STATE in HA (binary_sensor/sensor per camera), not
     # something that needs docker logs. A bridge that is down must not block
     # setup, so this is a plain refresh, not first_refresh.
     bridge_health = None
     if bridge_url:
-        bridge_health = BridgeHealthCoordinator(hass, bridge_url)
+        bridge_health = BridgeHealthCoordinator(hass, bridge_url, bridge_token)
         await bridge_health.async_refresh()
     saver = ClipSaver(
         hass, api, coordinator, entry.options.get(CONF_SAVE_FOLDER) or None
@@ -87,6 +92,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "api": api,
         "coordinator": coordinator,
         "bridge_url": bridge_url,
+        "bridge_token": bridge_token,
         "bridge_health": bridge_health,
         "clip_saver": saver,
     }

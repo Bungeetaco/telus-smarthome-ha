@@ -20,6 +20,7 @@ from .const import (
     CONF_ACCESS_TOKEN,
     CONF_AUTH_DOMAIN,
     CONF_AUTO_SAVE,
+    CONF_BRIDGE_TOKEN,
     CONF_BRIDGE_URL,
     CONF_HOUSEHOLD_ID,
     CONF_KEEP_DAYS,
@@ -118,6 +119,7 @@ class TelusOptionsFlow(OptionsFlow):
             user_input[CONF_SAVE_FOLDER] = folder
             bridge = (user_input.get(CONF_BRIDGE_URL) or "").strip()
             user_input[CONF_BRIDGE_URL] = bridge
+            user_input[CONF_BRIDGE_TOKEN] = (user_input.get(CONF_BRIDGE_TOKEN) or "").strip()
             if folder and not await self.hass.async_add_executor_job(
                 _can_write, folder
             ):
@@ -137,6 +139,9 @@ class TelusOptionsFlow(OptionsFlow):
             data_schema=vol.Schema(
                 {
                     vol.Optional(CONF_BRIDGE_URL, default=current or ""): str,
+                    vol.Optional(
+                        CONF_BRIDGE_TOKEN, default=opts.get(CONF_BRIDGE_TOKEN, "")
+                    ): str,
                     vol.Optional(
                         CONF_AUTO_SAVE, default=opts.get(CONF_AUTO_SAVE, False)
                     ): bool,

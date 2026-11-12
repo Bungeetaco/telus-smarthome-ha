@@ -83,21 +83,34 @@ GStreamer's `webrtcbin` (libnice + libwebrtc-grade media) handles ICE
 candidate selection and media correctly. The bridge:
 
 ```
-webrtcbin → rtph264depay → h264parse → (appsink) → ffmpeg -c:v copy → RTSP → MediaMTX → HA
+webrtcbin ─ rtph264depay (AVC) ─ h264parse (byte-stream, SPS/PPS before every IDR) ─ queue ─┐
+         └ rtpopusdepay ─ opusdec ─┐                                                      mpegtsmux ─ fdsink ─▶ ffmpeg -f mpegts
+                    audiotestsrc (silence) ─┴ audiomixer (live) ─ opusenc ─ queue ────────────────┘   (-c:v copy, audio → AAC)
+                                                                                                        └▶ RTSP ─▶ MediaMTX ─▶ HA / Frigate
 ```
 
-No video re-encode (pass-through copy). The bridge is **keyed by device id**,
-so one container serves multiple cameras, each on its own MediaMTX path
-(`telus_<deviceId>`). A watchdog restarts a session whose video has gone stale
-(the camera caps a live session at ~10 minutes), reconnecting with the stored
-credentials when they're still valid, else waiting for HA to supply fresh ones.
+No video re-encode (pass-through copy). RTP packets are re-stamped with their
+arrival time and smoothed per track (the camera's RTP clock is frame-count
+based), so the MPEG-TS carries real timestamps. Audio is always present: the
+camera's Opus is decoded into a live mixer with a silence source and
+re-encoded, so a camera that sends no audio (or pauses it) yields silence
+rather than a stalled muxer or a changed track count. The bridge is **keyed by
+device id**, so one container serves multiple cameras, each on its own
+MediaMTX path (`telus_<deviceId>`). A watchdog restarts a session whose video
+has gone stale, reconnecting with the stored credentials when they're still
+valid, else waiting for HA to supply fresh ones (sessions run for hours; the
+old ~10-minute cap is no longer observed). The control API accepts only AWS
+Kinesis Video signaling endpoints and, with `BRIDGE_TOKEN` set, only callers
+presenting the shared secret.
 
 ## Known limits / TODO
 
 - **On-demand**: the bridge should release a camera when no one is viewing
   (free the viewer slot + upload bandwidth) — detect readers via the MediaMTX
   API.
-- **Audio** is not muxed into the RTSP output yet.
+- **Audio** is in the stream (AAC, from the camera's Opus mixed with silence;
+  see `gst_bridge/README` knobs `ENABLE_AUDIO`, `AUDIO_GAIN_DB`,
+  `AUDIO_MIX_LATENCY_MS`).
 - **Events** come from the 30 s device poll; MQTT would make them real-time.
 - **Clips**: `/video_interval` resources carry `kvsBundle` references to
   recorded clips — not yet exposed.

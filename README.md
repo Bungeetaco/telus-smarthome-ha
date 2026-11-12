@@ -210,7 +210,11 @@ services:
 and set the integration's bridge URL to `http://127.0.0.1:8787`. If Home
 Assistant runs on another machine, keep the defaults and set `LAN_IP` in `.env`
 instead; the bridge logs a warning at startup when `RTSP_READ_BASE` is
-loopback-only.
+loopback-only. When the API is reachable from other hosts, set `BRIDGE_TOKEN`
+in `.env` (`openssl rand -hex 24`) and the same value in the integration's
+"bridge token" option; the bridge then refuses `/session/*` without it. The
+signaling endpoints in a `/start` body are always checked against
+`ENDPOINT_ALLOW_RE` (AWS Kinesis Video hosts only).
 
 ### Verifying the bridge
 
@@ -224,6 +228,16 @@ loopback-only.
   `no one is publishing` (nothing reached the publish step).
 - In Home Assistant the same data is on `binary_sensor.<camera>_bridge_stream`
   (attributes) and `sensor.<camera>_bridge_reconnects`.
+- Audio: `/health` shows `audio_source` (`camera` once the camera's audio has
+  been heard, else `silence`), `audio_rms_db` for the camera's decoded audio
+  and for the published mix (within a few dB of each other when the mixer
+  is placing the camera's audio; a mix 40 dB below the camera means its
+  buffers arrive later than `AUDIO_MIX_LATENCY_MS`), `last_au_age_s` per
+  track (which side stopped), and the two `pre_keyframe_*` counters (what was
+  dropped before the first video keyframe at start-up).
+- Tests run inside the bridge's test image (the runtime image has no H.264
+  encoder): `docker build --target test -t gst_bridge-test gst_bridge/` then
+  `docker run --rm --init --ulimit nofile=65536:65536 -v $PWD/gst_bridge/tests:/t:ro gst_bridge-test python3 -I -m unittest discover -s /t`.
 - The bridge logs `answer rtcp-fb: ... nack, nack pli` once per session: that is
   the camera agreeing to retransmit lost packets. If `nack` disappears, loss
   recovery is off and recordings will smear again.
@@ -246,7 +260,16 @@ loopback-only.
 | `WEBRTC_NACK` | `1` | Negotiate RTCP NACK on the video transceiver so lost RTP packets are retransmitted (the camera supports `nack` and `nack pli`). `0` disables. |
 | `WEBRTC_JITTER_MS` | `300` | webrtcbin jitterbuffer depth; must cover one retransmission round trip for NACK to help. |
 | `FFMPEG_KILL_GRACE_SEC` | `3` | After closing ffmpeg's pipes and sending SIGTERM, wait this long before SIGKILL. |
-| `PAD_SETTLE_MS` | `1500` | How long the MPEG-TS muxer waits for the camera's audio pad after the first pad before publishing video-only. |
+| `PAD_SETTLE_MS` | `1500` | How long to wait for the camera's audio pad after the first pad before logging that the audio track is silence for now (a late pad still joins the mix). |
+| `ENABLE_AUDIO` | `1` | Request the camera's audio (Opus). `0` = never ask for it; the published stream still carries a (silent) AAC track so its track count never changes. |
+| `AUDIO_GAIN_DB` | `15` | Mic boost applied by ffmpeg before the AAC encode (the camera mic is quiet; a limiter follows). |
+| `AUDIO_MIX_LATENCY_MS` | `1000` | The camera's audio is decoded into a live mixer with a silence source; this is how late its buffers may arrive before the slot is filled with silence, and the audio latency it adds. |
+| `AUDIO_FALLBACK_AFTER` | `3` | After this many consecutive failed reconnects the next attempts do not ask the camera for audio at all (the track is then silence). |
+| `BRIDGE_TOKEN` | empty | Shared secret for `/session/*`: callers must send it as `X-Bridge-Token` (the integration's "bridge token" option). `/health` stays open. |
+| `ENDPOINT_ALLOW_RE` | AWS KVS pattern | Regex the signaling endpoints in a `/start` body must match (`wss`/`https` hosts under `*.kinesisvideo.<region>.amazonaws.com`); anything else is refused with 400. |
+| `RTSP_PUBLISH_BASE` / `RTSP_READ_BASE` | `rtsp://mediamtx:8554` | Where the bridge publishes, and the base of the URL it hands Home Assistant (compose sets the read base from `LAN_IP`). |
+| `BRIDGE_PORT` | `8787` | Control API port. |
+| `WATCHDOG_INTERVAL_SEC` | `3` | How often the self-healing watchdog looks at every session. |
 | (timing) | built in | RTP packets are re-stamped with their arrival time and each track runs through a smoothing clock (`_Pll`, ~2 s window); `/health` shows `rtp_restamped`, `rtp_unstamped` and `arrival_hist`. The camera's own RTP clock is frame-count based and its Wi-Fi delivery bursty, see `docs/BACKLOG.md`. |
 | `PIPE_BUFFER_BYTES` | `1048576` | Capacity of ffmpeg's stdin pipe (`F_SETPIPE_SZ`) so `fdsink` hands a whole cluster over in one write. |
 | `BRIDGE_HOST` | `0.0.0.0` | Bind address of the control API. Use `127.0.0.1` when Home Assistant runs on the same host. |

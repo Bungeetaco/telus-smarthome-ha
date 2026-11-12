@@ -20,6 +20,51 @@ breaking changes between minor versions until the API surface stabilizes.
   `backoff: true` while waiting. Observed afterwards: one offer per ~3 min and
   the connectivity flapping slowed to match.
 
+### Added / Changed (gst_bridge) — backlog sweep 2026-11-12
+- **Audio is continuous and always present** (BACKLOG B3, C4). `mpegtsmux`
+  (a GstAggregator with no next-time hook; `force-live` only exists from
+  GStreamer 1.24) emits nothing until every pad has a buffer, so a camera
+  pausing its audio stalled the video and the watchdog restarted a healthy
+  session after 8 s; and a session without audio changed MediaMTX's track
+  count under its readers. The camera's Opus is now decoded into a live
+  `audiomixer` together with a silence source and re-encoded (`opusenc`),
+  so there is always exactly one audio track and an audio pause is silence.
+  The video-only fallback and the "audio pad never arrived" case produce the
+  same two-track stream; a late audio pad simply joins the mix. New knob
+  `AUDIO_MIX_LATENCY_MS` (1000). The pre-keyframe audio gate moved to the mix
+  output. `/health` gains `audio_source` (`camera`/`silence`) and
+  `audio_rms_db` (camera vs mix, from `level` meters). Verified live: camera
+  and mix within 1 dB, Frigate 5 fps; a test closes a valve on the audio for
+  3 s and asserts the mux keeps emitting.
+- **Control API hardening** (BACKLOG A2). `/start` refuses signaling
+  endpoints outside `ENDPOINT_ALLOW_RE` (AWS Kinesis Video `wss`/`https`
+  hosts), so the bridge cannot be used as a reachability oracle; with
+  `BRIDGE_TOKEN` set, `/session/*` requires the `X-Bridge-Token` header
+  (constant-time compare; `/health` stays open for the Docker healthcheck).
+  Compose and `.env.example` carry the knob; the integration sends the
+  token from its new "bridge token" option.
+- **Test build stage** (BACKLOG D1). `gstreamer1.0-plugins-ugly` (x264enc,
+  tests only) moved to a `test` stage; the runtime image has no H.264
+  encoder. Measured: 1137 MB runtime vs 1141 MB test image, i.e. the
+  package was never the size problem; ffmpeg's libav libraries are, and
+  only dropping ffmpeg (B1 option b) would change that.
+
+### Added / Changed (integration 0.14.0)
+- Options flow: **bridge token**, sent as `X-Bridge-Token` on `/session/*`
+  (and on `/health`); a 401 from the bridge is logged with the fix.
+- `binary_sensor.<camera>_bridge_stream` attributes gain `audio_source`,
+  `pre_keyframe_dropped`, `pre_keyframe_audio_dropped`, `last_au_age_s`.
+- Clip stream URL is read from the confirmed response field
+  `body.streamingUrl` (BACKLOG E2; the regex sweep stays as fallback).
+
+### Operations (outside this repo, recorded here because the backlog lived here)
+- BACKLOG B4: the host's 10-minute container watchdog (`ha-vm-maintenance`)
+  restarts Frigate when a camera reads 0 fps for 5 min while its source still
+  answers ffprobe (the wedged-capture state after a stream rotation).
+- BACKLOG A5: the same run re-tightens `.storage/core.config_entries` to
+  0600; Home Assistant rewrites it 0644 on every save (its Store is not
+  private), so a one-time chmod did not hold.
+
 ### Fixed (gst_bridge) — MPEG-TS instead of Matroska
 - **A mid-session H.264 parameter change ended the session.** The Matroska
   path (below) died with `gst_matroska_mux_video_pad_setcaps: Could not

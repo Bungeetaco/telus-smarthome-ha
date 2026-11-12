@@ -34,11 +34,12 @@ async def async_setup_entry(
     store = hass.data[DOMAIN][entry.entry_id]
     coordinator = store["coordinator"]
     bridge_url = store.get("bridge_url")
+    bridge_token = store.get("bridge_token") or ""
 
     entities = []
     for dev_id, dev in coordinator.data.items():
         if "camera" in device_type_of(dev) or "doorbell" in device_type_of(dev):
-            entities.append(TelusCamera(coordinator, dev_id, bridge_url))
+            entities.append(TelusCamera(coordinator, dev_id, bridge_url, bridge_token))
     _LOGGER.debug("Set up %d TELUS camera(s)", len(entities))
     async_add_entities(entities)
 
@@ -48,10 +49,12 @@ class TelusCamera(TelusEntity, Camera):
 
     _attr_supported_features = CameraEntityFeature.STREAM
 
-    def __init__(self, coordinator, device_id: str, bridge_url: str | None) -> None:
+    def __init__(self, coordinator, device_id: str, bridge_url: str | None,
+                 bridge_token: str = "") -> None:
         TelusEntity.__init__(self, coordinator, device_id)
         Camera.__init__(self)
         self._bridge_url = bridge_url
+        self._bridge_token = bridge_token
         self._attr_unique_id = f"{device_id}_camera"
         self._rtsp_url: str | None = None
 
@@ -88,7 +91,16 @@ class TelusCamera(TelusEntity, Camera):
                 async with session.post(
                     url,
                     json={"deviceId": self._device_id, "liveConfig": live_config},
+                    headers={"X-Bridge-Token": self._bridge_token} if self._bridge_token else None,
                 ) as resp:
+                    if resp.status == 401:
+                        _LOGGER.error(
+                            "%s: bridge %s rejected the token (HTTP 401): set the same "
+                            "value in the integration's 'bridge token' option and the "
+                            "bridge's BRIDGE_TOKEN",
+                            self._device_id, self._bridge_url,
+                        )
+                        return None
                     if resp.status != 200:
                         _LOGGER.error(
                             "%s: bridge %s refused the session: HTTP %s %s",

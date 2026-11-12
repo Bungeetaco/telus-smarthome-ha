@@ -604,10 +604,20 @@ def _clip_items(data: Any) -> list[dict]:
 
 
 def _find_url(data: Any) -> str | None:
-    """Find a stream URL anywhere in a response, preferring an .m3u8."""
+    """Stream URL from the clip-stream response.
+
+    Confirmed shape (2026-11-12, GET .../streaming/{household}/clip/{id}?protocol=HLS):
+    {"body": {"streamingUrl": "<https URL>"}, "returnCode": 0, "correlationId": "..."}
+    (returnCode 7512 with an empty streamingUrl = clip not available). The known
+    field is read first; the regex sweep stays as a fallback for other shapes."""
     import json as _j
     import re
 
+    if isinstance(data, dict):
+        body = data.get("body")
+        url = body.get("streamingUrl") if isinstance(body, dict) else None
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            return url
     blob = _j.dumps(data)
     m = re.search(r'https?://[^\s"\\\']+\.m3u8[^\s"\\\']*', blob)
     if m:

@@ -33,7 +33,8 @@ BRIDGE_HEALTH_TIMEOUT = 5
 SESSION_ATTRS = (
     "healthy", "started", "secs_since_frame", "reconnect_attempts",
     "reconnects_total", "gave_up", "nack_negotiated", "audio_requested",
-    "audio_fallback", "audio_active", "video_drops", "audio_drops",
+    "audio_fallback", "audio_active", "audio_source", "video_drops", "audio_drops",
+    "pre_keyframe_dropped", "pre_keyframe_audio_dropped", "last_au_age_s",
 )
 PROCESS_ATTRS = (
     "fds", "threads", "ffmpeg_children", "session_objects", "wedged_sessions",
@@ -44,18 +45,21 @@ PROCESS_ATTRS = (
 class BridgeHealthCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """GET {bridge_url}/health every 30 s; never raises for a down bridge."""
 
-    def __init__(self, hass: HomeAssistant, bridge_url: str) -> None:
+    def __init__(self, hass: HomeAssistant, bridge_url: str, bridge_token: str = "") -> None:
         super().__init__(
             hass, _LOGGER, name=f"{DOMAIN}_bridge_health",
             update_interval=BRIDGE_HEALTH_INTERVAL,
         )
         self.bridge_url = bridge_url.rstrip("/")
+        # /health is unauthenticated on the bridge; the header is sent anyway so
+        # a future bridge that closes it keeps working.
+        self._headers = {"X-Bridge-Token": bridge_token} if bridge_token else None
 
     async def _async_update_data(self) -> dict[str, Any]:
         session = async_get_clientsession(self.hass)
         try:
             async with async_timeout.timeout(BRIDGE_HEALTH_TIMEOUT):
-                async with session.get(f"{self.bridge_url}/health") as resp:
+                async with session.get(f"{self.bridge_url}/health", headers=self._headers) as resp:
                     # 503 = the bridge says it is sick; the body is still JSON.
                     body = await resp.json(content_type=None)
                     body["_reachable"] = True

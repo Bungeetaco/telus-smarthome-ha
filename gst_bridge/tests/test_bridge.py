@@ -107,11 +107,15 @@ class MediaChain(unittest.TestCase):
             f"audiotestsrc num-buffers={50 * cls.SECONDS} samplesperbuffer=960 is-live=false ! "
             "audio/x-raw,rate=48000,channels=2 ! opusenc ! rtpopuspay pt=111 ! "
             "application/x-rtp,media=audio,encoding-name=OPUS,payload=111,clock-rate=48000 ! "
-            + b.AUDIO_BRANCH + " "
+            + b.AUDIO_BRANCH + " " + b.AUDIO_MIX + " "
             + b.MUX_CHAIN % fd
         )
         pipe = Gst.parse_launch(desc)
         pipe.set_state(Gst.State.PLAYING)
+        # The silence source is live and endless (as in production), so the
+        # pipeline is ended from here once the finite sources have played out.
+        time.sleep(cls.SECONDS + 1.5)
+        pipe.send_event(Gst.Event.new_eos())
         msg = pipe.get_bus().timed_pop_filtered(
             30 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
         pipe.set_state(Gst.State.NULL)
@@ -322,21 +326,57 @@ class MediaChain(unittest.TestCase):
         self.assertNotIn("Could not find codec parameters", trace)
 
 
+    def test_audio_pause_does_not_stall_the_mux(self):
+        """BACKLOG B3: the camera pausing its audio (DTX, Wi-Fi) must not stop
+        the video. The real audio goes through a valve that is closed for 3 s;
+        the mux must keep emitting (the silence source fills the gap) and the
+        bus must stay clean."""
+        fd = os.open(os.devnull, os.O_WRONLY)
+        pipe = Gst.parse_launch(
+            "videotestsrc is-live=true ! video/x-raw,width=160,height=120,framerate=20/1 ! "
+            "x264enc tune=zerolatency key-int-max=20 speed-preset=ultrafast ! rtph264pay pt=101 config-interval=1 ! "
+            "application/x-rtp,media=video,encoding-name=H264,payload=101,clock-rate=90000 ! "
+            + b.VIDEO_BRANCH + " "
+            "audiotestsrc is-live=true samplesperbuffer=960 ! audio/x-raw,rate=48000,channels=1 ! opusenc ! "
+            "rtpopuspay pt=111 ! application/x-rtp,media=audio,encoding-name=OPUS,payload=111,clock-rate=48000 ! "
+            "valve name=v ! " + b.AUDIO_BRANCH + " " + b.AUDIO_MIX + " " + b.MUX_CHAIN % fd)
+        n = {"before": 0, "during": 0, "after": 0}
+        phase = {"p": "before"}
+
+        def pr(pad, info):
+            n[phase["p"]] += 1
+            return Gst.PadProbeReturn.OK
+        pipe.get_by_name("out").get_static_pad("sink").add_probe(b.OUT_PROBE_TYPE, pr)
+        pipe.set_state(Gst.State.PLAYING)
+        time.sleep(3)
+        pipe.get_by_name("v").set_property("drop", True)
+        phase["p"] = "during"
+        time.sleep(3)
+        pipe.get_by_name("v").set_property("drop", False)
+        phase["p"] = "after"
+        time.sleep(2)
+        msg = pipe.get_bus().pop_filtered(Gst.MessageType.ERROR)
+        pipe.set_state(Gst.State.NULL)
+        os.close(fd)
+        self.assertIsNone(msg, msg.parse_error() if msg else "")
+        self.assertGreater(n["before"], 50, n)
+        self.assertGreater(n["during"], 50, f"mux stalled while audio paused: {n}")
+        self.assertGreater(n["after"], 20, n)
+
     def test_audio_gate_holds_audio_until_first_video_keyframe(self):
-        """Audio access units are dropped while the session has not yet passed
-        a video keyframe, and flow once it has (so the TS never opens with a
-        stretch of audio alone, which made ffmpeg's probe give up on video)."""
+        """Mixed audio is dropped on its way into the muxer while the session
+        has not yet passed a video keyframe, and flows once it has (so the TS
+        never opens with a stretch of audio alone, which made ffmpeg's probe
+        give up on video)."""
         def run(kf_seen):
             sess = b.GstSession("test", {}, "rtsp://x/pub", "rtsp://x/read", audio=True)
             sess._kf_seen = kf_seen
             pipe = Gst.parse_launch(
                 "audiotestsrc num-buffers=25 samplesperbuffer=960 ! audio/x-raw,rate=48000,channels=1 ! "
-                "opusenc ! rtpopuspay pt=111 ! "
-                "application/x-rtp,media=audio,encoding-name=OPUS,payload=111,clock-rate=48000 ! "
-                "rtpopusdepay name=adepay ! fakesink")
+                "opusenc name=aenc ! fakesink")
             passed = []
-            src = pipe.get_by_name("adepay").get_static_pad("src")
-            src.add_probe(Gst.PadProbeType.BUFFER, sess._on_au, "audio")
+            src = pipe.get_by_name("aenc").get_static_pad("src")
+            src.add_probe(Gst.PadProbeType.BUFFER, sess._on_mix_out, None)
             src.add_probe(Gst.PadProbeType.BUFFER,
                           lambda pad, info: passed.append(1) or Gst.PadProbeReturn.OK)
             pipe.set_state(Gst.State.PLAYING)
@@ -344,12 +384,12 @@ class MediaChain(unittest.TestCase):
                 10 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
             pipe.set_state(Gst.State.NULL)
             self.assertEqual(msg.type, Gst.MessageType.EOS)
-            return len(passed), sess._pre_kf_audio_dropped, sess.audio_active
-        passed, dropped, active = run(False)       # opusenc may add a lookahead packet
-        self.assertEqual((passed, active), (0, False))
+            return len(passed), sess._pre_kf_audio_dropped
+        passed, dropped = run(False)       # opusenc may add a lookahead packet
+        self.assertEqual(passed, 0)
         self.assertGreaterEqual(dropped, 25)
-        passed, dropped, active = run(True)
-        self.assertEqual((dropped, active), (0, True))
+        passed, dropped = run(True)
+        self.assertEqual(dropped, 0)
         self.assertGreaterEqual(passed, 25)
 
     def test_build_chain_strings(self):
@@ -357,6 +397,11 @@ class MediaChain(unittest.TestCase):
         self.assertNotIn("rtpopusdepay", b.build_chain(7, False))
         self.assertIn("mux.sink_65", b.build_chain(7, True))
         self.assertIn("mpegtsmux", b.build_chain(7, False))
+        # the audio track exists even without a camera audio pad (BACKLOG C4)
+        self.assertIn("audiomixer", b.build_chain(7, False))
+        self.assertIn("mux.sink_65", b.build_chain(7, False))
+        self.assertIn("-map", b.GstSession("d", {}, "rtsp://x", "rtsp://x", audio=False)._ffmpeg_cmd(False))
+        self.assertIn("0:a", b.GstSession("d", {}, "rtsp://x", "rtsp://x", audio=False)._ffmpeg_cmd(False))
 
 
 class Pll(unittest.TestCase):
@@ -430,6 +475,37 @@ class LiveConfig(unittest.TestCase):
         url = b.sign_wss_url(b.parse_live_config(self.PAYLOAD), "ha-test")
         for needle in ("X-Amz-ChannelARN", "X-Amz-ClientId=ha-test", "X-Amz-Expires=299", "X-Amz-Signature"):
             self.assertIn(needle, url)
+
+    def test_endpoint_allow_list(self):
+        ok = ["wss://v-abc123.kinesisvideo.ca-central-1.amazonaws.com",
+              "https://r-abc123.kinesisvideo.us-west-2.amazonaws.com",
+              "wss://m-d73cdb17.kinesisvideo.ca-central-1.amazonaws.com/"]
+        bad = ["wss://evil.example.com", "wss://kinesisvideo.ca-central-1.amazonaws.com.evil.net",
+               "http://v-abc.kinesisvideo.ca-central-1.amazonaws.com", "ws://10.13.37.3:1234",
+               None, 42, "wss://v-abc.kinesisvideo.ca-central-1.amazonaws.com:8443"]
+        for u in ok:
+            self.assertTrue(b.endpoint_allowed(u), u)
+        for u in bad:
+            self.assertFalse(b.endpoint_allowed(u), u)
+        cfg = {"wss_endpoint": ok[0], "https_endpoint": ok[1]}
+        self.assertIsNone(b.check_endpoints(cfg))
+        self.assertIn("https_endpoint", b.check_endpoints({**cfg, "https_endpoint": bad[0]}))
+        self.assertIn("missing", b.check_endpoints({"https_endpoint": ok[1]}))
+
+    def test_shared_secret(self):
+        class Req:
+            def __init__(self, **h):
+                self.headers = h
+        saved = b.BRIDGE_TOKEN
+        try:
+            b.BRIDGE_TOKEN = ""
+            self.assertTrue(b.authorized(Req()))
+            b.BRIDGE_TOKEN = "s3cret"
+            self.assertFalse(b.authorized(Req()))
+            self.assertFalse(b.authorized(Req(**{"X-Bridge-Token": "wrong"})))
+            self.assertTrue(b.authorized(Req(**{"X-Bridge-Token": "s3cret"})))
+        finally:
+            b.BRIDGE_TOKEN = saved
 
     def test_device_id_regex(self):
         self.assertTrue(b.DEVICE_ID_RE.fullmatch("db-C0F5358935AC"))

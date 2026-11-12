@@ -1,15 +1,15 @@
 # Pinned by digest (Debian stable point releases are the pin; per-package
 # versions would break on the next security update). Refresh with:
 #   docker buildx imagetools inspect debian:bookworm-slim --format '{{.Manifest.Digest}}'
-FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS base
 # gstreamer1.0-libav is NOT in the data path (opusdec is in -base, the RTP
-# depayloaders in -good, webrtcbin in -bad) and pulled ~150 MB of codecs;
-# gstreamer1.0-plugins-ugly stays only for x264enc, which tests/ use to
-# synthesise an RTP source.
+# depayloaders in -good, webrtcbin in -bad) and pulled ~150 MB of codecs.
+# gstreamer1.0-plugins-ugly (x264enc, used only by tests/ to synthesise an RTP
+# source) lives in the `test` stage below, not in the runtime image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-gi python3-aiohttp python3-boto3 python3-websocket \
       gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-      gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+      gstreamer1.0-plugins-bad \
       gstreamer1.0-nice gir1.2-gst-plugins-bad-1.0 \
       ffmpeg ca-certificates \
  && rm -rf /var/lib/apt/lists/*
@@ -25,3 +25,12 @@ WORKDIR /app
 COPY telus_gst_bridge.py .
 EXPOSE 8787
 CMD ["python3", "telus_gst_bridge.py"]
+
+# Test image: `docker build --target test -t gst_bridge-test .` then run the
+# suite in it (see tests/). Adds the encoder the tests need to make H.264.
+FROM base AS test
+RUN apt-get update && apt-get install -y --no-install-recommends gstreamer1.0-plugins-ugly \
+ && rm -rf /var/lib/apt/lists/*
+
+# Default target (last stage): the runtime image compose builds.
+FROM base AS runtime

@@ -54,6 +54,12 @@ services:
       ENABLE_AUDIO: "${ENABLE_AUDIO:-1}"
       # Mic boost in dB (camera mic is quiet). 0 = none. Try 10-25.
       AUDIO_GAIN_DB: "${AUDIO_GAIN_DB:-15}"
+      # Shared secret for /session/* (X-Bridge-Token). Empty = unauthenticated;
+      # set it in .env and in the integration's "bridge token" option.
+      BRIDGE_TOKEN: "${BRIDGE_TOKEN:-}"
+      # How late (ms) the camera's audio may arrive before the mixer fills the
+      # slot with silence; adds the same amount of end-to-end audio latency.
+      AUDIO_MIX_LATENCY_MS: "${AUDIO_MIX_LATENCY_MS:-1000}"
       # Self-healing tuning (optional overrides):
       # STREAM_STALE_SEC: "8"
       # STARTUP_GRACE_SEC: "25"

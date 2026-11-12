@@ -20,6 +20,7 @@ import asyncio
 import base64
 import faulthandler
 import fcntl
+import hmac
 import json
 import os
 import re
@@ -66,6 +67,17 @@ LISTEN_PORT = int(os.environ.get("BRIDGE_PORT", "8787"))
 # same host; set BRIDGE_HOST=127.0.0.1 then, so nothing else on the LAN can
 # stop a session or point the bridge at its own signaling server.
 BRIDGE_HOST = os.environ.get("BRIDGE_HOST", "0.0.0.0")
+# Shared secret for /session/*: when set, callers must send it in the
+# X-Bridge-Token header (Home Assistant: the integration's "bridge token"
+# option). /health stays open: it carries no secrets and the Docker
+# healthcheck reads it. Empty = no authentication (loopback deployments).
+BRIDGE_TOKEN = os.environ.get("BRIDGE_TOKEN", "")
+# Only AWS Kinesis Video signaling endpoints may be dialled: a caller who can
+# reach the API must not be able to point the bridge (the one VM the firewall
+# lets through) at an arbitrary host as a reachability oracle.
+ENDPOINT_ALLOW_RE = re.compile(os.environ.get(
+    "ENDPOINT_ALLOW_RE",
+    r"^(wss|https)://[a-z0-9.-]+\.kinesisvideo\.[a-z0-9-]+\.amazonaws\.com(/.*)?$"))
 BRIDGE_VERSION = os.environ.get("BRIDGE_VERSION", "unknown")
 # device_id ends up in the RTSP path, an ffmpeg argument and every log line.
 DEVICE_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
@@ -159,6 +171,29 @@ def parse_live_config(payload: dict) -> dict:
     }
 
 
+def endpoint_allowed(url) -> bool:
+    """True for a signaling endpoint the bridge may dial (see ENDPOINT_ALLOW_RE)."""
+    return isinstance(url, str) and ENDPOINT_ALLOW_RE.match(url) is not None
+
+
+def check_endpoints(cfg: dict) -> str | None:
+    """Return an error string if a live config points outside AWS KVS."""
+    for key in ("wss_endpoint", "https_endpoint"):
+        if cfg.get(key) and not endpoint_allowed(cfg[key]):
+            return f"{key} not allowed: {cfg[key][:80]}"
+    if not cfg.get("wss_endpoint"):
+        return "wss_endpoint missing"
+    return None
+
+
+def authorized(request) -> bool:
+    """Shared-secret check for the session endpoints (no-op without a token)."""
+    if not BRIDGE_TOKEN:
+        return True
+    given = request.headers.get("X-Bridge-Token", "")
+    return hmac.compare_digest(given.encode(), BRIDGE_TOKEN.encode())
+
+
 def sign_wss_url(c: dict, client_id: str) -> str:
     params = {"X-Amz-ChannelARN": c["channel_arn"], "X-Amz-ClientId": client_id}
     url = f"{c['wss_endpoint']}?{urlencode(params)}"
@@ -249,8 +284,32 @@ VIDEO_BRANCH = (
     "queue name=vq leaky=downstream max-size-time=5000000000 max-size-buffers=0 max-size-bytes=0 ! "
     "mux.sink_64"   # mpegtsmux pads are named by PID; PIDs below 0x40 are reserved
 )
+# Audio is CONTINUOUS by construction. mpegtsmux (a GstAggregator without a
+# next-time hook) emits nothing until every pad has a buffer, so a camera that
+# pauses its audio (Opus DTX, Wi-Fi hiccup) used to stall the video with it and
+# past 8 s the watchdog restarted a healthy session (BACKLOG B3). And a session
+# without audio (no pad within PAD_SETTLE_MS, or the video-only fallback)
+# changed MediaMTX's track count under running readers, so go2rtc/Frigate had
+# to reconnect and recordings lost sound (BACKLOG C4). Now the camera's Opus is
+# decoded into a live audiomixer that also has a silence source, and the mix
+# is re-encoded: there is always exactly one audio track, and a pause on the
+# camera side is silence, not a stall. The real audio arrives up to
+# AUDIO_MIX_LATENCY_MS after its (smoothed) timestamp; the mixer waits that
+# long before it fills the slot with silence.
+AUDIO_MIX_LATENCY_MS = int(os.environ.get("AUDIO_MIX_LATENCY_MS", "1000"))
+AUDIO_RAW_CAPS = "audio/x-raw,rate=48000,channels=1,format=S16LE,layout=interleaved"
 AUDIO_BRANCH = (
-    "rtpopusdepay name=adepay ! opusparse ! "
+    "rtpopusdepay name=adepay ! opusparse ! opusdec plc=true ! audioconvert ! audioresample ! "
+    + AUDIO_RAW_CAPS + " ! level name=clevel interval=2000000000 ! "
+    "queue name=aqin leaky=downstream max-size-time=3000000000 max-size-buffers=0 max-size-bytes=0 ! "
+    "amix."
+)
+AUDIO_MIX = (
+    "audiotestsrc name=silence wave=silence is-live=true samplesperbuffer=960 ! "
+    + AUDIO_RAW_CAPS + " ! queue ! amix. "
+    "audiomixer name=amix latency=%d ! " % (AUDIO_MIX_LATENCY_MS * 1_000_000)
+    + AUDIO_RAW_CAPS + " ! level name=mlevel interval=2000000000 ! "
+    "opusenc name=aenc bitrate=64000 ! "
     "queue name=aq leaky=downstream max-size-time=5000000000 max-size-buffers=0 max-size-bytes=0 ! "
     "mux.sink_65"
 )
@@ -259,12 +318,11 @@ MUX_CHAIN = "mpegtsmux name=mux ! fdsink name=out sync=false fd=%d"
 # list per PES and never a single buffer, so a BUFFER-only probe never fires
 # and the watchdog kills a healthy session as "stale" after 8 s (2026-11-12).
 OUT_PROBE_TYPE = Gst.PadProbeType.BUFFER | Gst.PadProbeType.BUFFER_LIST
-MUX_AUDIO_PAD = "sink_65"
 
 
 def build_chain(fd: int, audio: bool) -> str:
     """gst-launch description of everything downstream of webrtcbin's pads."""
-    desc = MUX_CHAIN % fd + " " + VIDEO_BRANCH
+    desc = MUX_CHAIN % fd + " " + VIDEO_BRANCH + " " + AUDIO_MIX
     if audio:
         desc += " " + AUDIO_BRANCH
     return desc
@@ -387,6 +445,7 @@ class GstSession:
         self._pre_kf_audio_dropped = 0 # audio AUs dropped before it
         self._last_kf_request = 0.0
         self._last_au_ts = {"video": 0.0, "audio": 0.0}
+        self.audio_rms_db: dict[str, float] = {}   # from the `level` meters
         self._restamped = 0
         self._unstamped = 0                              # packets whose arrival was unknown
         # Diagnostics: inter-arrival histograms at two points (see /health).
@@ -596,6 +655,7 @@ class GstSession:
             bus = self.pipe.get_bus()
             bus.add_signal_watch()
             bus.connect("message::error", self._on_bus_error)
+            bus.connect("message::element", self._on_bus_element)
 
             if self._stopping.is_set():
                 return  # stop() raced the setup; nothing started yet
@@ -618,6 +678,20 @@ class GstSession:
             self.loop.run()
         except Exception as err:  # noqa: BLE001
             _LOG.exception("[%s] session crashed: %s", dev, err)
+
+    def _on_bus_element(self, bus, msg):
+        """`level` meters: RMS of the camera's decoded audio ("camera") and of
+        the mix that is published ("mix"), in dBFS, for /health. A camera value
+        with a mix value 40 dB lower means the mixer is dropping the camera's
+        audio (timestamps outside AUDIO_MIX_LATENCY_MS)."""
+        st = msg.get_structure()
+        if st is None or st.get_name() != "level":
+            return
+        rms = st.get_value("rms")
+        if rms:
+            name = msg.src.get_name() if msg.src else ""
+            key = "camera" if name == "clevel" else "mix"
+            self.audio_rms_db[key] = round(float(rms[0]), 1)
 
     def _on_bus_error(self, bus, msg):
         err, debug = msg.parse_error()
@@ -795,16 +869,10 @@ class GstSession:
 
     def _settle_locked(self) -> None:
         if "audio" not in self._pads and self.audio:
-            # Let the muxer start video-only instead of waiting for a track
-            # that is not coming.
-            mux = self._chain.get_by_name("mux")
-            apad = mux.get_static_pad(MUX_AUDIO_PAD)
-            aq = self._chain.get_by_name("aq")
-            if apad is not None:
-                if aq is not None:
-                    aq.get_static_pad("src").unlink(apad)
-                mux.release_request_pad(apad)
-            _LOG.warning("[%s] audio pad did not arrive within %d ms; publishing video-only",
+            # The silence source already feeds the mixer, so the stream is
+            # publishing with a (silent) audio track; a late audio pad simply
+            # joins the mix when it arrives.
+            _LOG.warning("[%s] audio pad did not arrive within %d ms; audio is silence until it does",
                          self.device_id, PAD_SETTLE_MS)
         if "video" not in self._pads:
             _LOG.warning("[%s] no video pad within %d ms of the first pad",
@@ -850,10 +918,15 @@ class GstSession:
         chain.get_by_name("vdepay").get_static_pad("src").add_probe(
             Gst.PadProbeType.BUFFER, self._on_au, "video")
         chain.get_by_name("vq").connect("overrun", self._on_video_overrun)
+        # The mixed/encoded audio is what enters the muxer: gate it on the
+        # first video keyframe there (see _on_mix_out).
+        chain.get_by_name("aenc").get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, self._on_mix_out, None)
+        chain.get_by_name("aq").connect("overrun", self._on_audio_overrun)
         if self.audio:
             chain.get_by_name("adepay").get_static_pad("src").add_probe(
                 Gst.PadProbeType.BUFFER, self._on_au, "audio")
-            chain.get_by_name("aq").connect("overrun", self._on_audio_overrun)
+            chain.get_by_name("aqin").connect("overrun", self._on_audio_overrun)
         chain.sync_state_with_parent()
         _LOG.info("[%s] publishing via ffmpeg pid %d (audio=%s) -> %s",
                   self.device_id, proc.pid, self.audio, self.publish_url)
@@ -947,15 +1020,6 @@ class GstSession:
         keyframe: the stream must open with SPS/PPS/IDR."""
         buf = info.get_buffer()
         self._last_au_ts[kind] = time.time()
-        if kind == "audio" and not self._kf_seen:
-            # No audio before the first video keyframe. The muxer emits in DTS
-            # order, so audio that arrived while the depayloader was still
-            # waiting for a keyframe would come out first and alone; ffmpeg's
-            # probe window (analyzeduration, measured on the stream that has
-            # advanced furthest) then closed on audio only and the session
-            # died with "Could not find codec parameters" (2026-11-12).
-            self._pre_kf_audio_dropped += 1
-            return Gst.PadProbeReturn.DROP
         if kind == "video" and not self._kf_seen:
             if buf.has_flags(Gst.BufferFlags.DELTA_UNIT):
                 # The camera does not start a session on an IDR, and
@@ -996,6 +1060,19 @@ class GstSession:
             self.audio_active = True
         return Gst.PadProbeReturn.OK
 
+    def _on_mix_out(self, pad, info, _):
+        """Mixed, re-encoded audio on its way into the muxer. No audio before
+        the first video keyframe: the muxer emits in DTS order, so audio
+        (here: the silence source, running from the first instant) would come
+        out first and alone, ffmpeg's probe window (analyzeduration, measured
+        on the stream that has advanced furthest) would close on audio only
+        and the session die with "Could not find codec parameters"
+        (2026-11-12)."""
+        if not self._kf_seen:
+            self._pre_kf_audio_dropped += 1
+            return Gst.PadProbeReturn.DROP
+        return Gst.PadProbeReturn.OK
+
     def _on_video_overrun(self, queue):
         self.video_drops += 1  # ffmpeg is not draining; the queue dropped a buffer
 
@@ -1020,17 +1097,16 @@ class GstSession:
                "-thread_queue_size", "512",
                "-analyzeduration", "1000000", "-probesize", "2000000",
                "-f", "mpegts", "-i", "pipe:0", "-map", "0:v", "-c:v", "copy"]
-        if audio:
-            # "0:a?": optional, so a session whose audio track never arrived
-            # (settle timeout) still publishes video.
-            # aresample=async=1: the camera's Opus RTP clock jumps backwards by
-            # ~100 ms now and then (seen as "Non-monotonous DTS" on the AAC
-            # output); async resampling squeezes/stretches to keep the output
-            # clock monotonic instead of ffmpeg rewriting timestamps per packet.
-            cmd += ["-map", "0:a?",
-                    "-filter:a", "aresample=async=1:min_hard_comp=0.100:first_pts=0,"
-                                 f"volume={AUDIO_GAIN_DB}dB,alimiter=limit=0.9:level=disabled",
-                    "-c:a", "aac", "-b:a", "64k"]
+        # The TS always carries one audio track (the mixer's output, silence
+        # when the camera sends none or `audio` is False), so MediaMTX's track
+        # count never changes under its readers.
+        # aresample=async=1: keeps the output clock monotonic across the
+        # occasional backward jump instead of ffmpeg rewriting timestamps.
+        del audio  # kept in the signature for the callers and tests
+        cmd += ["-map", "0:a",
+                "-filter:a", "aresample=async=1:min_hard_comp=0.100:first_pts=0,"
+                             f"volume={AUDIO_GAIN_DB}dB,alimiter=limit=0.9:level=disabled",
+                "-c:a", "aac", "-b:a", "64k"]
         cmd += ["-max_interleave_delta", "1000000",
                 "-f", "rtsp", "-rtsp_transport", "tcp", self.publish_url]
         return cmd
@@ -1093,6 +1169,8 @@ def _spawn_session(device_id, cfg, pub, read_url, attempts=0, audio=None) -> Gst
 
 
 async def handle_start(request: web.Request) -> web.Response:
+    if not authorized(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
     device_id = request.match_info["device_id"]
     if not DEVICE_ID_RE.fullmatch(device_id):
         return web.json_response({"error": "invalid device_id"}, status=400)
@@ -1107,6 +1185,10 @@ async def handle_start(request: web.Request) -> web.Response:
         cfg = parse_live_config(payload)
     except (KeyError, AttributeError, TypeError) as err:
         return web.json_response({"error": f"bad liveConfig: {err!r}"}, status=400)
+    bad = check_endpoints(cfg)
+    if bad:
+        _LOG.warning("[%s] start refused: %s", device_id, bad)
+        return web.json_response({"error": bad}, status=400)
     read_url = f"{RTSP_READ_BASE.rstrip('/')}/telus_{device_id}"
     pub = f"{RTSP_PUBLISH_BASE.rstrip('/')}/telus_{device_id}"
 
@@ -1267,6 +1349,8 @@ WATCHDOG_LAST_TICK = 0.0
 
 
 async def handle_stop(request: web.Request) -> web.Response:
+    if not authorized(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
     device_id = request.match_info["device_id"]
     if not DEVICE_ID_RE.fullmatch(device_id):
         return web.json_response({"error": "invalid device_id"}, status=400)
@@ -1298,6 +1382,10 @@ async def handle_health(request: web.Request) -> web.Response:
             "audio_requested": s.audio,
             "audio_fallback": ENABLE_AUDIO and not s.audio,
             "audio_active": s.audio_active,
+            # "camera" once the camera's audio has been heard this session,
+            # else "silence" (the track exists either way)
+            "audio_source": "camera" if s.audio_active else "silence",
+            "audio_rms_db": s.audio_rms_db,
             "audio_bytes": s.audio_bytes,
             "video_bytes": s.video_bytes,
             "rtp_restamped": s._restamped,
@@ -1353,6 +1441,9 @@ if __name__ == "__main__":
     if urlparse(RTSP_READ_BASE).hostname in ("127.0.0.1", "localhost", "mediamtx"):
         _LOG.warning("RTSP_READ_BASE=%s is only reachable from this host; if Home "
                      "Assistant runs elsewhere set LAN_IP in .env", RTSP_READ_BASE)
+    _LOG.info("session API %s; signaling endpoints must match %s",
+              "requires X-Bridge-Token" if BRIDGE_TOKEN else "is unauthenticated (set BRIDGE_TOKEN)",
+              ENDPOINT_ALLOW_RE.pattern)
     threading.Thread(target=_watchdog, daemon=True).start()
     _LOG.info("watchdog started (stale>%ss, grace=%ss, max_reconnects=%d, stop_timeout=%ss, "
               "nack=%s, jitter=%dms)",
