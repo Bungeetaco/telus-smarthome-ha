@@ -36,11 +36,35 @@ def _media_root(hass: HomeAssistant) -> str:
     return dirs.get("local") or hass.config.path("media")
 
 
+def _allowed_roots(hass: HomeAssistant) -> list[str]:
+    """Folders a clip may be written under: every configured media dir."""
+    dirs = getattr(hass.config, "media_dirs", None) or {}
+    roots = [os.path.realpath(p) for p in dirs.values() if p]
+    roots.append(os.path.realpath(hass.config.path("media")))
+    return roots
+
+
 def save_base(hass: HomeAssistant, folder: str | None) -> str:
-    """Folder clips are saved into: the configured folder, else <media>/telus_clips."""
+    """Folder clips are saved into: the configured folder, else <media>/telus_clips.
+
+    A caller-supplied folder (options or the download_clip service) must sit
+    under one of Home Assistant's media directories; anything else is refused so
+    a service call cannot write (or prune) outside the media tree."""
     if folder and folder.strip():
-        return folder.strip()
+        wanted = os.path.realpath(folder.strip())
+        for root in _allowed_roots(hass):
+            if os.path.commonpath([wanted, root]) == root:
+                return wanted
+        raise ValueError(
+            f"save folder {folder!r} is outside Home Assistant's media directories"
+        )
     return os.path.join(_media_root(hass), SAVE_SUBDIR)
+
+
+# Files this integration wrote: "<YYYYMMDD_HHMMSS|clip>_<event>_<clipid>.mp4".
+# _prune deletes nothing that does not match, so a save folder pointed at a
+# shared camera directory never loses other recordings.
+_OWN_CLIP = re.compile(r"^(\d{8}_\d{6}|clip)_[a-z0-9-]+_[A-Za-z0-9._-]+\.mp4$")
 
 
 def clip_path(
@@ -54,7 +78,9 @@ def clip_path(
     stamp = t.strftime("%Y%m%d_%H%M%S") if isinstance(t, datetime) else "clip"
     ev = _SAFE.sub("-", _clip_event(clip).lower()).strip("-") or "clip"
     name = f"{stamp}_{ev}_{_SAFE.sub('_', cid)}.mp4"
-    return os.path.join(save_base(hass, folder), _SAFE.sub("_", device_id), name)
+    # strip(".") so a device id of ".." cannot step out of the save folder
+    dev_dir = _SAFE.sub("_", device_id).strip(".") or "device"
+    return os.path.join(save_base(hass, folder), dev_dir, name)
 
 
 def _ffmpeg_bin(hass: HomeAssistant) -> str | None:
@@ -115,7 +141,8 @@ class ClipSaver:
             _LOGGER.info("Saving TELUS clip %s with %s -> %s", cid, ffmpeg, path)
             proc = await asyncio.create_subprocess_exec(
                 ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+                # no "file": a hostile playlist must not be able to read local files
+                "-protocol_whitelist", "http,https,tcp,tls,crypto",
                 "-i", url, "-c", "copy", "-bsf:a", "aac_adtstoasc",
                 "-movflags", "+faststart", "-f", "mp4", tmp,
                 stdout=asyncio.subprocess.DEVNULL,
@@ -185,7 +212,7 @@ class ClipSaver:
         cutoff = time.time() - keep_days * 86400
         for dirpath, _dirs, files in os.walk(root):
             for f in files:
-                if f.endswith(".mp4"):
+                if _OWN_CLIP.match(f):
                     p = os.path.join(dirpath, f)
                     try:
                         if os.path.getmtime(p) < cutoff:

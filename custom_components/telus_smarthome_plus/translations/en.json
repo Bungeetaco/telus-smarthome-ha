@@ -14,7 +14,8 @@
     },
     "error": {
       "invalid_auth": "Login failed — check your email and password.",
-      "cannot_connect": "Couldn't reach the TELUS service. Check connectivity and try again."
+      "cannot_connect": "Couldn't reach the TELUS service. Check connectivity and try again.",
+      "bridge_unreachable": "Couldn't reach the camera bridge at that URL (/health). Check host, port 8787 and that the gst_bridge container is running. If Home Assistant runs on the same machine, use http://127.0.0.1:8787."
     },
     "abort": {
       "already_configured": "This household is already configured."
@@ -30,6 +31,9 @@
       },
       "ai_sensor": {
         "name": "AI Sensor"
+      },
+      "bridge_reconnects": {
+        "name": "Bridge reconnects"
       }
     },
     "binary_sensor": {
@@ -38,6 +42,9 @@
       },
       "connectivity": {
         "name": "Connectivity"
+      },
+      "bridge_stream": {
+        "name": "Bridge stream"
       }
     },
     "event": {
@@ -60,7 +67,8 @@
       }
     },
     "error": {
-      "cannot_write": "Home Assistant can't write to that folder. Check the path and that the share is mounted."
+      "cannot_write": "Home Assistant can't write to that folder. Check the path and that the share is mounted.",
+      "bridge_unreachable": "Couldn't reach the camera bridge at that URL (/health). Check host, port 8787 and that the gst_bridge container is running. If Home Assistant runs on the same machine, use http://127.0.0.1:8787."
     }
   },
   "services": {

@@ -59,16 +59,20 @@ class TelusConfigFlow(ConfigFlow, domain=DOMAIN):
                 password=user_input[CONF_PASSWORD],
                 auth_domain=user_input.get(CONF_AUTH_DOMAIN, DEFAULT_AUTH_DOMAIN),
             )
+            bridge = (user_input.get(CONF_BRIDGE_URL) or "").strip()
+            if bridge and not await _bridge_reachable(self.hass, bridge):
+                errors[CONF_BRIDGE_URL] = "bridge_unreachable"
             try:
-                await api.async_login()
-                await api.async_bootstrap()
+                if not errors:
+                    await api.async_login()
+                    await api.async_bootstrap()
             except TelusAuthError as err:
                 _LOGGER.warning("Login failed: %s", err)
                 errors["base"] = "invalid_auth"
             except TelusApiError as err:
                 _LOGGER.warning("API error during login: %s", err)
                 errors["base"] = "cannot_connect"
-            else:
+            if not errors:
                 await self.async_set_unique_id(api.household_id or user_input[CONF_USERNAME])
                 self._abort_if_unique_id_configured()
                 tokens = api.tokens
@@ -84,7 +88,7 @@ class TelusConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_REFRESH_TOKEN: tokens["refresh_token"],
                         CONF_PROFILE_ID: api.profile_id,
                         CONF_HOUSEHOLD_ID: api.household_id,
-                        CONF_BRIDGE_URL: user_input.get(CONF_BRIDGE_URL),
+                        CONF_BRIDGE_URL: bridge or None,
                     },
                 )
 
@@ -112,11 +116,15 @@ class TelusOptionsFlow(OptionsFlow):
         if user_input is not None:
             folder = (user_input.get(CONF_SAVE_FOLDER) or "").strip()
             user_input[CONF_SAVE_FOLDER] = folder
+            bridge = (user_input.get(CONF_BRIDGE_URL) or "").strip()
+            user_input[CONF_BRIDGE_URL] = bridge
             if folder and not await self.hass.async_add_executor_job(
                 _can_write, folder
             ):
                 errors[CONF_SAVE_FOLDER] = "cannot_write"
-            else:
+            if bridge and not await _bridge_reachable(self.hass, bridge):
+                errors[CONF_BRIDGE_URL] = "bridge_unreachable"
+            if not errors:
                 return self.async_create_entry(title="", data=user_input)
 
         opts = self.config_entry.options
@@ -142,6 +150,25 @@ class TelusOptionsFlow(OptionsFlow):
                 }
             ),
         )
+
+
+async def _bridge_reachable(hass, url: str) -> bool:
+    """GET {url}/health within 5 s. The #1 support issue was a bridge URL that
+    pointed at a loopback-only or unreachable host; catch it at config time."""
+    import aiohttp
+    import async_timeout
+
+    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+    try:
+        async with async_timeout.timeout(5):
+            async with async_get_clientsession(hass).get(
+                f"{url.rstrip('/')}/health"
+            ) as resp:
+                return resp.status in (200, 503)  # 503 = bridge up but sick
+    except (aiohttp.ClientError, TimeoutError, ValueError) as err:
+        _LOGGER.warning("Camera bridge %s not reachable: %s", url, err)
+        return False
 
 
 def _can_write(folder: str) -> bool:

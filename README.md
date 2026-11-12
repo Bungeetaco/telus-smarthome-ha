@@ -187,6 +187,51 @@ Built through API reverse-engineering of the TELUS SmartHome+ app. TELUS SmartHo
 
 [MIT](LICENSE) © 2026 Akram Mahmoud
 
+
+### Deploying next to Home Assistant on the same host (recommended)
+
+Bind everything to loopback so nothing else on the LAN can read the stream or
+publish onto it (MediaMTX allows anonymous publish by default). In
+`gst_bridge/docker-compose.override.yml` (auto-merged by compose, gitignored;
+`docker compose config` shows the effective result):
+
+```yaml
+services:
+  mediamtx:
+    environment:
+      MTX_RTSPADDRESS: "127.0.0.1:8556"   # also moves off 8554 if another RTSP server owns it
+  bridge:
+    environment:
+      RTSP_PUBLISH_BASE: "rtsp://127.0.0.1:8556"
+      RTSP_READ_BASE: "rtsp://127.0.0.1:8556"
+      BRIDGE_HOST: "127.0.0.1"
+```
+
+and set the integration's bridge URL to `http://127.0.0.1:8787`. If Home
+Assistant runs on another machine, keep the defaults and set `LAN_IP` in `.env`
+instead; the bridge logs a warning at startup when `RTSP_READ_BASE` is
+loopback-only.
+
+### Verifying the bridge
+
+- `curl -s http://127.0.0.1:8787/health | jq` — healthy looks like
+  `ok: true, degraded: false`, one session with `healthy: true`,
+  `secs_since_frame` near 0, `nack_negotiated: true`, and `process.ffmpeg_children`
+  equal to the number of cameras. Failure signatures: `secs_since_frame` past 8
+  (camera stopped sending), `gave_up: true` (needs the camera opened once in HA
+  to deliver fresh credentials), `wedged_sessions > 0` or `ffmpeg_children` above
+  the session count (restart the container), MediaMTX logging
+  `no one is publishing` (nothing reached the publish step).
+- In Home Assistant the same data is on `binary_sensor.<camera>_bridge_stream`
+  (attributes) and `sensor.<camera>_bridge_reconnects`.
+- The bridge logs `answer rtcp-fb: ... nack, nack pli` once per session: that is
+  the camera agreeing to retransmit lost packets. If `nack` disappears, loss
+  recovery is off and recordings will smear again.
+- `docker kill -s USR1 gst_bridge-bridge-1` dumps every thread's stack into the
+  container log when something hangs.
+- Docker marks the container unhealthy on HTTP 503 but never restarts it on its
+  own; pair it with a restart policy watcher (autoheal, a cron) if you want that.
+
 ### gst_bridge tuning knobs (environment)
 
 | Variable | Default | What it does |

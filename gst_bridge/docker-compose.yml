@@ -8,6 +8,11 @@ services:
     restart: unless-stopped
     network_mode: host
     init: true
+    # Nothing here needs privilege: no recordings, ports > 1024, config via env.
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     environment:
       MTX_PROTOCOLS: tcp
     mem_limit: 256m
@@ -29,6 +34,15 @@ services:
     restart: unless-stopped
     network_mode: host
     init: true                 # reaps the ffmpeg child processes cleanly
+    # Unprivileged + read-only: the bridge parses attacker-reachable SDP/RTP/
+    # H.264/Opus in C libraries, so a parser bug must not mean root with the
+    # host's network namespace. Writes go to the /tmp tmpfs only.
+    user: "65534:65534"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     environment:
       # Where the bridge PUBLISHES to MediaMTX (loopback on the same host).
       RTSP_PUBLISH_BASE: rtsp://127.0.0.1:8554
@@ -62,4 +76,4 @@ services:
       interval: 30s
       timeout: 6s
       retries: 3
-      start_period: 20s
+      start_period: 60s   # covers STARTUP_GRACE_SEC (25 s) plus a slow first KVS handshake

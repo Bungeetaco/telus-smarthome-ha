@@ -1,6 +1,6 @@
 """Camera platform for TELUS SmartHome+.
 
-Live view uses the KVS-WebRTC -> RTSP bridge (see kvs_bridge/). The camera
+Live view uses the KVS-WebRTC -> RTSP bridge (see gst_bridge/). The camera
 entity asks the bridge to start a viewer session for this device and hands HA
 the returned RTSP URL; HA's `stream` component takes it from there (and the
 HomeKit Bridge can then expose it to Apple Home).
@@ -75,12 +75,15 @@ class TelusCamera(TelusEntity, Camera):
         try:
             live_config = await api.async_get_live_config(self._device_id)
         except Exception as err:  # noqa: BLE001
-            _LOGGER.error("Could not get live config: %s", err)
+            _LOGGER.error("%s: could not get live config from TELUS: %s",
+                          self._device_id, err)
             return None
 
         session = async_get_clientsession(self.hass)
         url = f"{self._bridge_url.rstrip('/')}/session/{self._device_id}/start"
         try:
+            # The bridge itself waits up to 12 s for the video pad; 45 s covers a
+            # slow KVS handshake plus the request round trip.
             async with async_timeout.timeout(45):
                 async with session.post(
                     url,
@@ -88,16 +91,26 @@ class TelusCamera(TelusEntity, Camera):
                 ) as resp:
                     if resp.status != 200:
                         _LOGGER.error(
-                            "Bridge start failed %s: %s",
-                            resp.status,
-                            await resp.text(),
+                            "%s: bridge %s refused the session: HTTP %s %s",
+                            self._device_id, self._bridge_url, resp.status,
+                            (await resp.text())[:200],
                         )
                         return None
                     data = await resp.json()
+                    if data.get("started") is False:
+                        # The bridge answered with the URL anyway so HA can keep
+                        # retrying the RTSP source; nothing is published yet.
+                        _LOGGER.warning(
+                            "%s: bridge %s accepted the session but video has not "
+                            "started yet (reused=%s); the stream may be dark for a "
+                            "few seconds",
+                            self._device_id, self._bridge_url, data.get("reused"),
+                        )
                     self._rtsp_url = data.get("rtsp_url")
                     return self._rtsp_url
         except (aiohttp.ClientError, TimeoutError) as err:
-            _LOGGER.error("Bridge unreachable: %s", err)
+            _LOGGER.error("%s: bridge %s unreachable: %s",
+                          self._device_id, self._bridge_url, err)
             return None
 
     async def async_camera_image(

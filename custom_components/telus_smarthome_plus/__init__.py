@@ -27,6 +27,7 @@ from .const import (
     DOMAIN,
 )
 from .clips import SYNC_INTERVAL, ClipSaver, TelusClipView
+from .bridge_health import BridgeHealthCoordinator
 from .coordinator import TelusCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -66,19 +67,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = TelusCoordinator(hass, api)
     await coordinator.async_config_entry_first_refresh()
 
-    # One-time diagnostic: dump the raw device-list JSON so the shape can be
-    # confirmed. Safe to leave on; it just overwrites a file in /config.
-    await _dump_devices(hass, api)
-    # One-time: dump a camera's live-stream config (KVS channel + temp creds)
-    # so the bridge can be finalized. Runs once (guarded by file existence).
-    await _dump_livestream(hass, api, coordinator)
-
     # Persist any refreshed tokens back to the entry.
     _persist_tokens(hass, entry, api)
 
     bridge_url = entry.options.get(
         CONF_BRIDGE_URL, entry.data.get(CONF_BRIDGE_URL)
     )
+    # Bridge health is a STATE in HA (binary_sensor/sensor per camera), not
+    # something that needs docker logs. A bridge that is down must not block
+    # setup, so this is a plain refresh, not first_refresh.
+    bridge_health = None
+    if bridge_url:
+        bridge_health = BridgeHealthCoordinator(hass, bridge_url)
+        await bridge_health.async_refresh()
     saver = ClipSaver(
         hass, api, coordinator, entry.options.get(CONF_SAVE_FOLDER) or None
     )
@@ -86,6 +87,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "api": api,
         "coordinator": coordinator,
         "bridge_url": bridge_url,
+        "bridge_health": bridge_health,
         "clip_saver": saver,
     }
 
@@ -210,83 +212,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
     await hass.config_entries.async_reload(entry.entry_id)
-
-
-async def _dump_devices(hass: HomeAssistant, api: TelusSmartHomeApi) -> None:
-    """Write the raw device-list JSON to /config/telus_smarthome_plus_dump.json."""
-    import json
-
-    raw = getattr(api, "last_devices_raw", None)
-    if raw is None:
-        return
-    path = hass.config.path("telus_smarthome_plus_dump.json")
-    # one-time like _dump_livestream: once the file exists the setup is done and a
-    # WARNING on every restart is just noise (delete the file to re-dump)
-    import os
-
-    if await hass.async_add_executor_job(os.path.exists, path):
-        _LOGGER.debug("TELUS device dump already at %s; not rewriting", path)
-        return
-
-    def _write() -> None:
-        try:
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(raw, fh, indent=2, default=str)
-        except OSError as err:  # noqa: BLE001
-            _LOGGER.warning("Could not write device dump: %s", err)
-
-    await hass.async_add_executor_job(_write)
-    _LOGGER.info(
-        "TELUS device dump written to %s (first run only). Upload it to finish camera setup.",
-        path,
-    )
-
-
-async def _dump_livestream(hass: HomeAssistant, api, coordinator) -> None:
-    """One-time: request a camera's live-stream config and dump it to /config.
-
-    Guarded by file existence so it only opens one VIEWER session, not one per
-    restart. Delete the file to re-run.
-    """
-    import json
-    import os
-
-    from .entity import device_type_of
-
-    path = hass.config.path("telus_smarthome_plus_livestream.json")
-    if await hass.async_add_executor_job(os.path.exists, path):
-        return
-
-    camera_id = next(
-        (
-            dev_id
-            for dev_id, dev in coordinator.data.items()
-            if "camera" in device_type_of(dev) or "doorbell" in device_type_of(dev)
-        ),
-        None,
-    )
-    if not camera_id:
-        return
-
-    try:
-        cfg = await api.async_get_live_config(camera_id)
-    except Exception as err:  # noqa: BLE001
-        cfg = {"_error": str(err)}
-        _LOGGER.warning("Live-config dump failed for %s: %s", camera_id, err)
-
-    def _write() -> None:
-        try:
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump({"deviceId": camera_id, "liveConfig": cfg}, fh,
-                          indent=2, default=str)
-        except OSError as err:  # noqa: BLE001
-            _LOGGER.warning("Could not write live-stream dump: %s", err)
-
-    await hass.async_add_executor_job(_write)
-    _LOGGER.warning(
-        "TELUS live-stream config written to %s. Upload it to finish live video.",
-        path,
-    )
 
 
 def _persist_tokens(

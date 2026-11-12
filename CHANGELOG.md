@@ -6,6 +6,58 @@ breaking changes between minor versions until the API surface stabilizes.
 
 ## [Unreleased]
 
+### Added
+- `binary_sensor.<camera>_bridge_stream` (connectivity, diagnostic): ON while the
+  camera bridge is reachable and this camera's live session has video flowing.
+  Attributes carry the bridge's per-session counters (`secs_since_frame`,
+  `reconnect_attempts`, `reconnects_total`, `gave_up`, `nack_negotiated`,
+  `audio_fallback`, `video_drops`, `audio_drops`) and its process-level leak
+  indicators (`bridge_fds`, `bridge_ffmpeg_children`, `bridge_wedged_sessions`,
+  `bridge_version`, ...). A bridge that is down shows OFF with a `reason`, not
+  unavailable, so automations can trigger on it.
+- `sensor.<camera>_bridge_reconnects` (total_increasing, diagnostic): how often
+  the bridge had to restart this camera's session since it started.
+- Both come from a new `BridgeHealthCoordinator` polling `GET {bridge_url}/health`
+  every 30 s (5 s timeout). Needs gst_bridge >= the 2026-11-12 build.
+
+### Changed
+- Config flow and options flow probe `{bridge_url}/health` and refuse an
+  unreachable bridge URL with a clear message (the #1 support issue was a URL
+  pointing at a loopback-only or wrong host).
+- Camera: logs name the device and bridge URL; a `/start` that returns
+  `started: false` is logged as a warning instead of silently handing HA a path
+  nobody publishes yet.
+- gst_bridge compose: both containers run as uid 65534 with a read-only root
+  filesystem, all capabilities dropped and `no-new-privileges`; `/tmp` is a
+  tmpfs (GStreamer registry, Python caches). Healthcheck `start_period` 60 s.
+  Dockerfile pinned to `debian:bookworm-slim` by digest; `gstreamer1.0-libav`
+  dropped (not in the data path; the image stays ~1.1 GB because ffmpeg itself
+  needs the libav libraries).
+
+### Removed
+- The one-time diagnostic dumps (`telus_smarthome_plus_dump.json`,
+  `_livestream.json`, `_clips.json`). The livestream dump wrote a temporary AWS
+  credential set and the channel ARN world-readable into `/config`, where it
+  also rode along in backups. Delete those three files if they exist.
+
+### Fixed
+- `download_clip` / the save folder option: a folder is only accepted under one
+  of Home Assistant's media directories; the pruner deletes only files this
+  integration wrote (`<stamp>_<event>_<clipid>.mp4`), never every `.mp4` under
+  the folder; a device id of `..` can no longer escape the save folder.
+- Clip remux no longer whitelists the `file` protocol for ffmpeg, so a hostile
+  playlist cannot reference local files.
+- API errors log at most 200 characters of a response body and never a full
+  token response.
+- `camera.py` docstring pointed at a `kvs_bridge/` directory that does not exist.
+
+### Deployment note (this household, 2026-11-12)
+- MediaMTX (`MTX_RTSPADDRESS: 127.0.0.1:8556`) and the bridge API
+  (`BRIDGE_HOST: 127.0.0.1`) are bound to loopback in the local compose
+  override; HA's `go2rtc.yaml` doorbell sources and the integration's bridge URL
+  point at `127.0.0.1`. Before this any device on the IoT VLAN could read the
+  doorbell stream or publish its own video onto the path.
+
 ### Fixed (gst_bridge)
 - **Review follow-up (same day): defects found by four independent code reviews.**
   Full list with evidence in `docs/BACKLOG.md`; applied here:

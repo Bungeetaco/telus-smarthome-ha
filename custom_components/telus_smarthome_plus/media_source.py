@@ -199,7 +199,6 @@ class TelusMediaSource(MediaSource):
             clips, raw = await store["api"].async_get_clips(dev_id, MAX_CLIPS)
         except Exception as err:  # noqa: BLE001
             raise BrowseError(f"Could not list clips: {err}") from err
-        await self._dump_once(raw)
 
         rows = []
         for c in clips:
@@ -245,20 +244,3 @@ class TelusMediaSource(MediaSource):
             children=children,
             children_media_class=MediaClass.VIDEO,
         )
-
-    async def _dump_once(self, raw: Any) -> None:
-        """Write the first raw clip-list response so field names can be checked."""
-        path = self.hass.config.path("telus_smarthome_plus_clips.json")
-
-        def _write() -> None:
-            import os
-
-            if os.path.exists(path):
-                return
-            try:
-                with open(path, "w", encoding="utf-8") as fh:
-                    json.dump(raw, fh, indent=2, default=str)
-            except OSError as err:  # noqa: BLE001
-                _LOGGER.warning("Could not write clips dump: %s", err)
-
-        await self.hass.async_add_executor_job(_write)

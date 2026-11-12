@@ -203,7 +203,10 @@ class TelusSmartHomeApi:
             or self._refresh_token
         )
         if not self._access_token:
-            raise TelusAuthError(f"no access token in response: {data}")
+            raise TelusAuthError(
+                "no access token in response "
+                f"(keys: {sorted(data) if isinstance(data, dict) else type(data).__name__})"
+            )
 
     # ------------------------------------------------------------------ #
     # Bootstrap
@@ -499,7 +502,7 @@ class TelusSmartHomeApi:
                             _retry=False,
                         )
                     if resp.status >= 400:
-                        raise TelusApiError(f"{method} {path} -> {resp.status}: {text}")
+                        raise TelusApiError(f"{method} {path} -> {resp.status}: {text[:200]}")
                     data = await _json(resp, text)
                     # Several endpoints (refreshDeviceStatus, send-commands, ...)
                     # return HTTP 200 with a status envelope; a non-zero
