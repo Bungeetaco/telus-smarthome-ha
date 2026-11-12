@@ -84,3 +84,21 @@ one host (10.13.38.2) that sits on the IoT VLAN.
 - Residual: after a camera-side stall of ~1 s the smoothing clock catches up
   over ~8 frames at ~110 ms spacing (brief slow motion). Acceptable; a faster
   gain would re-introduce burst jitter.
+
+## Incident 2026-11-12 08:04Z: doorbell offline (camera side)
+
+- Session published 06:15:58Z streamed continuously for 108 min, then MediaMTX
+  saw the publisher go silent (i/o timeout 08:04:32Z). From then on: signaling
+  reachable (offers sent, 43 of 806 answered), ICE never completed, no media.
+- Camera facts: ARP for 10.13.38.212 failed at 14:05Z; later pings 10 % loss
+  with 60-2000 ms RTT on the LAN; cloud connectivity flipping every 30-60 s;
+  Wi-Fi RSSI (-61) and temperature (46 C) last reported 05:14Z. The living
+  room camera (other bridge) was fine throughout: not a host/network issue.
+- Likely causes, in order: camera Wi-Fi link collapsed (AP/channel/interference)
+  or the camera is in a low-power/low-battery mode that refuses live view; the
+  integration never saw a battery resource, so battery level is unknown.
+  Check the TELUS app for battery and Wi-Fi, power-cycle the doorbell.
+- Open question: Frigate's 24/7 demand keeps the camera streaming almost
+  continuously (108 min sessions now that NACK keeps them alive). If the
+  doorbell is battery powered this is a battery-life trade-off worth deciding
+  deliberately (e.g. record on motion only).

@@ -6,6 +6,20 @@ breaking changes between minor versions until the API surface stabilizes.
 
 ## [Unreleased]
 
+### Fixed (gst_bridge)
+- **A camera that never answers was dialled every 27 s, forever.** Regression
+  from the credential-refresh change: the `/start` reuse path reset the
+  reconnect counter on every Home Assistant call, so the watchdog's "give up
+  after 6" never held. With the doorbell off Wi-Fi from 08:04 UTC on
+  2026-11-12 that meant 806 SDP offers in six hours, and the camera's cloud
+  connectivity flapped on/off every 30-60 s in step with the attempts (each
+  viewer request wakes the camera). Now the counter is reset only when video is
+  actually flowing; a connecting session is reused untouched; after giving up,
+  one fresh attempt is made per `RESTART_BACKOFF_SEC` (120 s), with audio,
+  inheriting the give-up state so the watchdog adds nothing. `/start` answers
+  `backoff: true` while waiting. Observed afterwards: one offer per ~3 min and
+  the connectivity flapping slowed to match.
+
 ### Fixed (gst_bridge) — real timestamps end to end
 - **Video was published at a fixed 19 fps clock regardless of the camera's real
   14-30 fps**, so Frigate recordings ran fast or slow against their audio and a
