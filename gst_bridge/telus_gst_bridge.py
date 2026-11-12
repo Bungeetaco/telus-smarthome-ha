@@ -23,7 +23,6 @@ import fcntl
 import json
 import os
 import re
-import select
 import signal
 import subprocess
 import threading
@@ -93,17 +92,15 @@ FFMPEG_KILL_GRACE_SEC = float(os.environ.get("FFMPEG_KILL_GRACE_SEC", "3"))
 # still owns the MediaMTX path and the new publish is refused.
 STOP_TIMEOUT_SEC = max(float(os.environ.get("STOP_TIMEOUT_SEC", "5")),
                        FFMPEG_KILL_GRACE_SEC + 3.0)
-# A pipe write that does not complete within this long means ffmpeg has stopped
-# reading; the data is dropped instead of blocking a GStreamer streaming thread
-# (video) or the audio writer. The video write runs on the depayloader's
-# streaming thread, so waiting longer only stalls the jitterbuffer: if ffmpeg
-# has not drained a 1 MiB pipe in half a second the session is dead anyway and
-# the stale watchdog (STREAM_STALE_SEC) restarts it.
-PIPE_WRITE_TIMEOUT_SEC = float(os.environ.get("PIPE_WRITE_TIMEOUT_SEC", "0.5"))
-# Pipe capacity requested with F_SETPIPE_SZ. The default 64 KiB is smaller than
-# one 1440x1920 keyframe (~115 KB), so every keyframe used to need ffmpeg to
-# read mid-write; with 1 MiB a keyframe is a single write that cannot stall.
+# Pipe capacity requested with F_SETPIPE_SZ for ffmpeg's stdin. The default
+# 64 KiB is smaller than one 1440x1920 keyframe (~115 KB); 1 MiB lets fdsink
+# hand a whole cluster over in one write.
 PIPE_BUFFER_BYTES = int(os.environ.get("PIPE_BUFFER_BYTES", str(1 << 20)))
+# webrtcbin adds its audio and video pads a few ms apart. The Matroska muxer
+# needs every track before it writes the header, so the first pad starts this
+# timer and the chain is built when the second pad arrives or the timer fires
+# (video-only if audio never showed up).
+PAD_SETTLE_MS = int(os.environ.get("PAD_SETTLE_MS", "1500"))
 # Packet-loss handling on the WebRTC leg. KVS is UDP; a 1440x1920 keyframe is
 # ~115 KB = ~95 RTP packets, so without retransmission a single lost packet
 # destroys the whole keyframe. Measured 2026-11-12 before this: 6 of 50
@@ -117,20 +114,15 @@ PIPE_BUFFER_BYTES = int(os.environ.get("PIPE_BUFFER_BYTES", str(1 << 20)))
 WEBRTC_NACK = _env_flag("WEBRTC_NACK")
 WEBRTC_JITTER_MS = int(os.environ.get("WEBRTC_JITTER_MS", "300"))
 
-# Audio (Opus -> AAC). The video path is untouched by audio: audio rides a
-# separate pipe into the SAME ffmpeg and is fed continuously (silence when the
-# camera sends nothing) so it can never starve/stall video. If a session fails
-# to come up with audio, the bridge automatically retries WITHOUT audio, so
+# Audio (Opus -> AAC). The camera's Opus is muxed, still encoded, into the same
+# Matroska stream as the video (timestamps from the same jitterbuffer, so A/V
+# stay in sync); ffmpeg decodes it, boosts it and encodes AAC for RTSP. If a
+# session fails to come up with audio, the bridge retries WITHOUT audio, so
 # audio can never take video down. Set ENABLE_AUDIO=0 to turn it off entirely.
 ENABLE_AUDIO = _env_flag("ENABLE_AUDIO")
 AUDIO_FALLBACK_AFTER = int(os.environ.get("AUDIO_FALLBACK_AFTER", "2"))  # failed reconnects before dropping audio
 # The camera's mic is quiet; boost it (dB) with a limiter so loud bangs don't clip.
 AUDIO_GAIN_DB = float(os.environ.get("AUDIO_GAIN_DB", "15"))
-AUDIO_RATE = 48000
-AUDIO_CHANNELS = 2
-AUDIO_FRAME_SEC = 0.02
-AUDIO_FRAME_BYTES = int(AUDIO_RATE * AUDIO_FRAME_SEC) * AUDIO_CHANNELS * 2  # s16le
-AUDIO_MAX_BACKLOG_BYTES = AUDIO_FRAME_BYTES * 25  # ~0.5s; drop older audio beyond this
 
 
 # --------------------------------------------------------------------------- #
@@ -202,15 +194,43 @@ def get_ice_servers(c: dict, client_id: str) -> list[str]:
 _ALL_SESSIONS: list["GstSession"] = []
 _ALL_SESSIONS_LOCK = threading.Lock()
 
-# The production video chain, in one place so a test can run the exact same
-# string against videotestsrc/x264enc/rtph264pay.
-VIDEO_CHAIN = (
-    "rtph264depay request-keyframe=true wait-for-keyframe=true ! "
-    "video/x-h264,alignment=au ! "
-    "h264parse config-interval=1 ! "
-    "video/x-h264,stream-format=byte-stream,alignment=au ! "
-    "appsink name=out emit-signals=true sync=false max-buffers=20 drop=false"
+# The production media chain, in one place so a test can run the exact same
+# description against videotestsrc/x264enc/rtph264pay (+ audiotestsrc/opusenc).
+#
+# Why Matroska: a raw Annex-B pipe carries no timestamps, so ffmpeg used to
+# stamp every frame from the SPS VUI (a fixed 19 fps on this camera) while the
+# real rate is 14-30 fps -- recordings ran fast or slow against their audio and
+# ffmpeg's interleaver held one stream back for seconds. matroskamux writes the
+# jitterbuffer's PTS for both tracks into the container; ffmpeg reads them.
+#
+# request-keyframe: a PLI goes back to the camera when the depayloader sees RTP
+# loss; wait-for-keyframe: the rest of that GOP is dropped rather than forwarded
+# smeared (needs AU alignment, hence the capsfilter right after the depayloader).
+# The per-branch leaky queues isolate the camera from a stalled ffmpeg: fdsink
+# blocks when the pipe is full, the queues then drop upstream instead of
+# back-pressuring the jitterbuffer, and the heartbeat (a probe on fdsink's
+# sink pad) stops, so the watchdog restarts the session.
+VIDEO_BRANCH = (
+    "rtph264depay name=vdepay request-keyframe=true wait-for-keyframe=true ! "
+    "video/x-h264,alignment=au ! h264parse ! "
+    "video/x-h264,stream-format=avc,alignment=au ! "
+    "queue name=vq leaky=downstream max-size-time=2000000000 max-size-buffers=0 max-size-bytes=0 ! "
+    "mux.video_0"
 )
+AUDIO_BRANCH = (
+    "rtpopusdepay name=adepay ! opusparse ! "
+    "queue name=aq leaky=downstream max-size-time=2000000000 max-size-buffers=0 max-size-bytes=0 ! "
+    "mux.audio_0"
+)
+MUX_CHAIN = "matroskamux name=mux streamable=true ! fdsink name=out sync=false fd=%d"
+
+
+def build_chain(fd: int, audio: bool) -> str:
+    """gst-launch description of everything downstream of webrtcbin's pads."""
+    desc = MUX_CHAIN % fd + " " + VIDEO_BRANCH
+    if audio:
+        desc += " " + AUDIO_BRANCH
+    return desc
 
 
 def _grow_pipe(fd: int) -> None:
@@ -227,30 +247,27 @@ class GstSession:
                  audio: bool = False):
         self._stop_ts = 0.0                # when stop() was first called (0 = running)
         self._ffmpeg_lock = threading.Lock()
-        # Serialise pipe writes against _kill_ffmpeg closing the pipes: a write
-        # in flight on a GStreamer thread must never see its fd number closed
-        # and reused by another session's socket (os.write into the wrong fd).
-        self._vid_io = threading.Lock()
-        self._aud_io = threading.Lock()
         self._rtcp_fb_logged = False
         self.nack_negotiated = None        # True/False once the SDP answer is seen
         self.ffmpeg_exited = False
         self.video_drops = 0               # video AUs dropped because ffmpeg stopped reading
         self.audio_drops = 0
-        # After any dropped/partial video write the stream is corrupt until the
-        # next keyframe; delta frames are skipped until one arrives.
-        self._need_idr = False
         self._gave_up_logged = False
         self.reconnects_total = 0          # monotonic, carried across respawns (a counter, unlike reconnect_attempts)
         self.started_evt = threading.Event()
         self._ws_lock = threading.Lock()
         self.audio = audio                 # request + publish audio for this session
-        self.audio_active = False          # real camera audio is arriving
+        self.audio_active = False          # camera audio has reached the muxer
         self.audio_bytes = 0
-        self._audio_buf = bytearray()
-        self._audio_lock = threading.Lock()
-        self._audio_w = None               # write end of ffmpeg's audio pipe
-        self._audio_stop = threading.Event()
+        self.video_bytes = 0
+        self._pads: dict[str, Gst.Pad] = {}  # "video"/"audio" pads from webrtcbin
+        self._settle_id = 0                # GLib timeout waiting for the 2nd pad
+        self._chain_built = False
+        self._chain = None
+        # webrtcbin emits pad-added for audio and video from two streaming
+        # threads at the same time; building the chain and linking must not
+        # interleave (the second handler once saw chain_built with no chain).
+        self._pad_lock = threading.Lock()
         self.device_id = device_id
         self.cfg = cfg
         self.publish_url = publish_url
@@ -308,7 +325,6 @@ class GstSession:
                 self.ws.close(timeout=1)
         except Exception:
             pass
-        self._audio_stop.set()
         loop = self.loop
         if loop:
             # quit() on a loop that is not running yet is lost (the run() that
@@ -321,32 +337,22 @@ class GstSession:
         self._kill_ffmpeg()
 
     def _kill_ffmpeg(self) -> None:
-        """Close ffmpeg's input pipes and make sure the child is gone. Idempotent,
+        """Close ffmpeg's stdin and make sure the child is gone. Idempotent,
         safe from any thread, bounded to FFMPEG_KILL_GRACE_SEC + 2 s.
 
-        Closing the pipes matters more than the signal: ffmpeg 5.1 blocked in
-        read() on the video pipe does not act on SIGTERM, but EOF makes it
-        finish. Closing the read side also unblocks an audio writer stuck in
-        write() on the full audio pipe (EPIPE)."""
+        Closing the pipe matters more than the signal: ffmpeg 5.1 blocked in
+        read() does not act on SIGTERM, but EOF makes it finish. fdsink holds
+        the same fd number; after the close it errors out (EBADF/EPIPE), which
+        ends the GLib loop via the bus -- fine, the session is stopping."""
         with self._ffmpeg_lock:
             proc, self.ffmpeg = self.ffmpeg, None
-            aw, self._audio_w = self._audio_w, None
-        # Take the write locks so no _write_pipe is mid-flight on these fds
-        # while they are closed (bounded by the write timeouts).
-        with self._aud_io:
-            if aw is not None:
-                try:
-                    aw.close()
-                except Exception:
-                    pass
         if proc is None:
             return
-        with self._vid_io:
-            try:
-                if proc.stdin:
-                    proc.stdin.close()
-            except Exception:
-                pass
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
         if proc.poll() is None:
             try:
                 proc.terminate()
@@ -370,44 +376,6 @@ class GstSession:
         proc = self.ffmpeg
         return proc is not None and proc.poll() is None
 
-    def _write_pipe(self, fobj, data, timeout: float) -> bool:
-        """Write `data` to a non-blocking pipe, waiting at most `timeout` seconds
-        in total for ffmpeg to drain it. Returns False (data partly or wholly
-        dropped) if ffmpeg stopped reading or is gone. Never blocks for good."""
-        if fobj is None:
-            return False
-        try:
-            fd = fobj.fileno()
-        except Exception:
-            return False
-        view = memoryview(data)
-        deadline = time.monotonic() + timeout
-        while view:
-            try:
-                n = os.write(fd, view)
-                view = view[n:]
-                continue
-            except BlockingIOError:
-                pass
-            except OSError:
-                return False  # EPIPE / closed: ffmpeg is gone
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False
-            # poll(), not select(): select() raises ValueError for any fd >=
-            # 1024, which the nofile=65536 limit makes reachable, and a
-            # keyframe larger than the pipe would then be silently truncated.
-            try:
-                poller = select.poll()
-                poller.register(fd, select.POLLOUT)
-                events = poller.poll(int(remaining * 1000) + 1)
-            except (OSError, ValueError):
-                return False
-            if not events or events[0][1] & (select.POLLERR | select.POLLHUP
-                                              | select.POLLNVAL):
-                return False
-        return True
-
     def _teardown(self):
         """Release the pipeline. Runs on the session thread only."""
         self._kill_ffmpeg()  # idempotent; covers a stop() that never ran
@@ -427,10 +395,13 @@ class GstSession:
             pipe.get_bus().remove_signal_watch()
         except Exception:
             pass
-        # Break the reference cycle session -> webrtcbin -> signal closures ->
-        # session, so the pipeline (and libnice's UDP sockets) is finalised
-        # now rather than whenever the cyclic GC gets to it.
+        # Break the reference cycles session -> webrtcbin/chain -> signal and
+        # probe closures -> session, so the pipeline (libnice's UDP sockets,
+        # fdsink's fd) is finalised now rather than whenever the cyclic GC
+        # gets to it.
         self.webrtc = None
+        self._chain = None
+        self._pads = {}
         _LOG.info("[%s] session torn down (video drops=%d, audio drops=%d)",
                   self.device_id, self.video_drops, self.audio_drops)
 
@@ -629,110 +600,174 @@ class GstSession:
             except Exception as err:  # noqa: BLE001
                 _LOG.warning("[%s] ws send err: %s", self.device_id, err)
 
-    # ---- incoming media -> ffmpeg -> RTSP publish (no re-encode) ----
+    # ---- incoming media -> matroskamux -> fdsink -> ffmpeg -> RTSP publish ----
     def _on_pad(self, webrtc, pad):
+        """Every webrtcbin src pad must be linked before this handler returns:
+        the first RTP buffer is pushed right after pad-added, and a push on an
+        unlinked pad is a fatal not-linked error for the source (measured: the
+        audio pad arrives ~1 ms after the video pad, and waiting for it killed
+        every session). So the whole chain, including the muxer's request pad
+        for a track that has not arrived yet, is built on the FIRST pad; later
+        pads just link in. If a wanted track never arrives, _on_settle_timeout
+        releases its muxer pad so the header can be written without it."""
         if pad.direction != Gst.PadDirection.SRC:
             return
         caps = pad.get_current_caps()
         name = caps.to_string() if caps else ""
         _LOG.info("[%s] pad-added: %s", self.device_id, name[:80])
-        if "audio" in name:
-            self._on_audio_pad(pad)
+        kind = "audio" if "audio" in name else "video" if "video" in name else None
+        if kind is None:
             return
-        if "video" not in name:
+        if self._stopping.is_set():
             return
-        if self._stopping.is_set() or self.ffmpeg is not None:
-            # A second video pad (renegotiation) would spawn a second ffmpeg
-            # that nothing tracks; a pad after stop() would resurrect one.
-            _LOG.warning("[%s] ignoring video pad (stopping=%s, ffmpeg already running=%s)",
-                         self.device_id, self._stopping.is_set(), self.ffmpeg is not None)
-            return
+        if kind == "audio" and not self.audio:
+            return  # no audio transceiver was requested; nothing should arrive
+        with self._pad_lock:
+            if kind in self._pads:
+                _LOG.warning("[%s] ignoring duplicate %s pad", self.device_id, kind)
+                return
+            if not self._chain_built and not self._build_chain():
+                return
+            chain = self._chain
+            if chain is None:
+                return  # the build failed on the other pad's thread
+            ret = pad.link(chain.get_static_pad(f"{kind}_sink"))
+            if ret != Gst.PadLinkReturn.OK:
+                _LOG.error("[%s] %s pad link failed: %s", self.device_id, kind, ret)
+                return
+            self._pads[kind] = pad
+            if kind == "video" and not self.started:
+                # The stale clock starts now, not at the epoch: before this a
+                # freshly linked session was judged stale on the watchdog's next
+                # tick ("no frames 1794449565.4s"), burning a reconnect attempt
+                # before its first keyframe could arrive.
+                self.last_sample_ts = time.time()
+                self.started = True
+                self.started_evt.set()
+            want = {"video", "audio"} if self.audio else {"video"}
+            if want <= set(self._pads):
+                if self._settle_id:
+                    GLib.source_remove(self._settle_id)
+                    self._settle_id = 0
+            elif not self._settle_id:
+                self._settle_id = GLib.timeout_add(PAD_SETTLE_MS, self._on_settle_timeout)
 
-        # ffmpeg reads Annex-B H.264 from stdin, copies it to RTSP. With audio
-        # enabled it ALSO reads raw PCM from a second pipe and encodes AAC.
-        ar = aw = None
+    def _on_settle_timeout(self):
+        self._settle_id = 0
+        if self._stopping.is_set() or not self._chain_built or self._chain is None:
+            return False
+        with self._pad_lock:
+            self._settle_locked()
+        return False
+
+    def _settle_locked(self) -> None:
+        if "audio" not in self._pads and self.audio:
+            # Let the muxer write a video-only header instead of waiting for a
+            # track that is not coming.
+            mux = self._chain.get_by_name("mux")
+            apad = mux.get_static_pad("audio_0")
+            aq = self._chain.get_by_name("aq")
+            if apad is not None:
+                if aq is not None:
+                    aq.get_static_pad("src").unlink(apad)
+                mux.release_request_pad(apad)
+            _LOG.warning("[%s] audio pad did not arrive within %d ms; publishing video-only",
+                         self.device_id, PAD_SETTLE_MS)
+        if "video" not in self._pads:
+            _LOG.warning("[%s] no video pad within %d ms of the first pad",
+                         self.device_id, PAD_SETTLE_MS)
+
+    def _build_chain(self) -> bool:
+        """Spawn ffmpeg and create matroskamux -> fdsink plus a branch (with a
+        ghost sink pad) for every expected track. Returns False on failure."""
+        self._chain_built = True
         try:
-            if self.audio:
-                ar, aw = os.pipe()
-            cmd = self._ffmpeg_cmd(audio_fd=ar)
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                    stderr=subprocess.PIPE,
-                                    pass_fds=(ar,) if ar is not None else ())
+            proc = subprocess.Popen(self._ffmpeg_cmd(audio=self.audio),
+                                    stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         except Exception as err:  # noqa: BLE001
-            # ENOMEM / EAGAIN at pids_limit: leave nothing behind; the session
-            # never reaches `started`, so the watchdog respawns it.
-            for fd in (ar, aw):
-                if fd is not None:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
+            # ENOMEM / EAGAIN at pids_limit: the session never reaches
+            # `started`, so the watchdog respawns it.
             _LOG.error("[%s] could not start ffmpeg: %s", self.device_id, err)
-            return
+            return False
         with self._ffmpeg_lock:
             self.ffmpeg = proc
-            if aw is not None:
-                os.set_blocking(aw, False)  # writes are bounded by _write_pipe
-                _grow_pipe(aw)
-                self._audio_w = os.fdopen(aw, "wb", buffering=0)
-        if ar is not None:
-            os.close(ar)  # parent keeps only the write end
-        os.set_blocking(proc.stdin.fileno(), False)
-        _grow_pipe(proc.stdin.fileno())
+        fd = proc.stdin.fileno()
+        _grow_pipe(fd)
         threading.Thread(target=self._relay_ffmpeg_stderr, args=(proc,),
                          daemon=True).start()
-        if aw is not None:
-            threading.Thread(target=self._audio_writer, daemon=True).start()
-
-        # request-keyframe: a PLI goes back to the camera when the depayloader
-        # sees RTP loss; wait-for-keyframe: the rest of that GOP is dropped
-        # rather than forwarded as smeared frames (only meaningful with AU
-        # alignment, hence the capsfilter right after the depayloader).
-        chain = Gst.parse_bin_from_description(VIDEO_CHAIN, True)
-        self.pipe.add(chain)
-        chain.sync_state_with_parent()
-        ret = pad.link(chain.get_static_pad("sink"))
-        if ret != Gst.PadLinkReturn.OK:
-            _LOG.error("[%s] video pad link failed: %s", self.device_id, ret)
+        try:
+            chain = Gst.parse_bin_from_description(build_chain(fd, self.audio), False)
+        except GLib.Error as err:
+            _LOG.error("[%s] chain parse failed: %s", self.device_id, err)
             self._kill_ffmpeg()
-            return
-        appsink = chain.get_by_name("out")
-        appsink.connect("new-sample", self._on_sample)
-        # The stale clock starts now, not at the epoch: before this line a
-        # freshly linked session was judged stale on the watchdog's next tick
-        # ("no frames 1794449565.4s"), burning a reconnect attempt 3 s after
-        # pad-added, before the first keyframe could arrive.
-        self.last_sample_ts = time.time()
-        self.started = True
-        self.started_evt.set()
+            return False
+        self._chain = chain
+        self.pipe.add(chain)
+        for kind, depay_name in (("video", "vdepay"), ("audio", "adepay")):
+            depay = chain.get_by_name(depay_name)  # Gst.Iterator is not Python-iterable
+            if depay is None:
+                continue
+            ghost = Gst.GhostPad.new(f"{kind}_sink", depay.get_static_pad("sink"))
+            ghost.set_active(True)
+            chain.add_pad(ghost)
+        # Heartbeat and byte counters: buffers reaching fdsink are what ffmpeg
+        # actually gets; buffers leaving the branch queues count per track.
+        chain.get_by_name("out").get_static_pad("sink").add_probe(
+            Gst.PadProbeType.BUFFER, self._on_out_buffer, None)
+        chain.get_by_name("vq").get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, self._on_video_buffer, None)
+        chain.get_by_name("vq").connect("overrun", self._on_video_overrun)
+        if self.audio:
+            chain.get_by_name("aq").get_static_pad("src").add_probe(
+                Gst.PadProbeType.BUFFER, self._on_audio_buffer, None)
+            chain.get_by_name("aq").connect("overrun", self._on_audio_overrun)
+        chain.sync_state_with_parent()
         _LOG.info("[%s] publishing via ffmpeg pid %d (audio=%s) -> %s",
                   self.device_id, proc.pid, self.audio, self.publish_url)
+        return True
 
-    def _ffmpeg_cmd(self, audio_fd: int | None) -> list[str]:
-        """One argv builder for both variants.
+    def _on_out_buffer(self, pad, info, _):
+        self.last_sample_ts = time.time()  # heartbeat: data is reaching ffmpeg
+        return Gst.PadProbeReturn.OK
 
-        Known limitation (see docs/BACKLOG.md): a raw Annex-B pipe carries no
-        PTS, so ffmpeg stamps every video frame from the SPS VUI timing (a
-        fixed 19 fps on this camera; the -framerate flag is overridden by it)
-        while the camera really delivers 14-30 fps. Recordings therefore run
-        fast or slow against their audio. `-use_wallclock_as_timestamps` was
-        tried on 2026-11-12 and is NOT usable here: ffmpeg drains the 1 MiB
-        pipe in bursts and stamps every frame of a burst identically (storm of
-        "Non-monotonous DTS" warnings). The real fix is carrying the GStreamer
-        PTS in a container (matroskamux) or publishing with rtspclientsink.
-        -max_interleave_delta bounds how long the muxer holds the stream that
-        is ahead (default 10 s) so the skew costs at most 1 s of latency."""
+    def _on_video_buffer(self, pad, info, _):
+        self.video_bytes += info.get_buffer().get_size()
+        return Gst.PadProbeReturn.OK
+
+    def _on_audio_buffer(self, pad, info, _):
+        self.audio_bytes += info.get_buffer().get_size()
+        self.audio_active = True
+        return Gst.PadProbeReturn.OK
+
+    def _on_video_overrun(self, queue):
+        self.video_drops += 1  # ffmpeg is not draining; the queue dropped a buffer
+
+    def _on_audio_overrun(self, queue):
+        self.audio_drops += 1
+
+    def _ffmpeg_cmd(self, audio: bool) -> list[str]:
+        """ffmpeg reads the Matroska stream on stdin (video + optional Opus
+        audio, timestamps from the jitterbuffer), copies the video, decodes/
+        boosts/AAC-encodes the audio and publishes RTSP to MediaMTX.
+        -max_interleave_delta bounds how long the muxer may hold one stream
+        waiting for the other (default 10 s)."""
+        # No `-fflags +nobuffer`: with the Matroska demuxer it dropped a third
+        # of the video frames in the in-image test (59 of 90).
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
-               "-fflags", "+genpts", "-thread_queue_size", "512",
-               "-framerate", "30", "-f", "h264", "-i", "pipe:0"]
-        if audio_fd is not None:
-            cmd += ["-thread_queue_size", "512",
-                    "-f", "s16le", "-ar", str(AUDIO_RATE), "-ac", str(AUDIO_CHANNELS),
-                    "-i", f"pipe:{audio_fd}",
-                    "-map", "0:v", "-map", "1:a",
-                    "-filter:a", f"volume={AUDIO_GAIN_DB}dB,alimiter=limit=0.9:level=disabled",
+               "-thread_queue_size", "512",
+               "-f", "matroska", "-i", "pipe:0", "-map", "0:v", "-c:v", "copy"]
+        if audio:
+            # "0:a?": optional, so a session whose audio track never arrived
+            # (settle timeout) still publishes video.
+            # aresample=async=1: the camera's Opus RTP clock jumps backwards by
+            # ~100 ms now and then (seen as "Non-monotonous DTS" on the AAC
+            # output); async resampling squeezes/stretches to keep the output
+            # clock monotonic instead of ffmpeg rewriting timestamps per packet.
+            cmd += ["-map", "0:a?",
+                    "-filter:a", "aresample=async=1:min_hard_comp=0.100:first_pts=0,"
+                                 f"volume={AUDIO_GAIN_DB}dB,alimiter=limit=0.9:level=disabled",
                     "-c:a", "aac", "-b:a", "64k"]
-        cmd += ["-c:v", "copy", "-max_interleave_delta", "1000000",
+        cmd += ["-max_interleave_delta", "1000000",
                 "-f", "rtsp", "-rtsp_transport", "tcp", self.publish_url]
         return cmd
 
@@ -747,108 +782,6 @@ class GstSession:
                     _LOG.warning("[%s] ffmpeg[%d]: %s", self.device_id, proc.pid, text)
         except Exception:
             pass
-
-    # ---- audio: Opus -> raw PCM -> (paced, never-starving) -> ffmpeg ----
-    def _on_audio_pad(self, pad):
-        if not self.audio:
-            return
-        try:
-            chain = Gst.parse_bin_from_description(
-                "rtpopusdepay ! opusdec ! audioconvert ! audioresample ! "
-                f"audio/x-raw,format=S16LE,rate={AUDIO_RATE},channels={AUDIO_CHANNELS},"
-                "layout=interleaved ! "
-                "appsink name=aout emit-signals=true sync=false max-buffers=50 drop=true",
-                True,
-            )
-            self.pipe.add(chain)
-            chain.sync_state_with_parent()
-            pad.link(chain.get_static_pad("sink"))
-            chain.get_by_name("aout").connect("new-sample", self._on_audio_sample)
-            _LOG.info("[%s] audio branch linked (Opus -> PCM)", self.device_id)
-        except Exception as err:  # noqa: BLE001
-            # Audio failure must never affect video: just carry on with silence.
-            _LOG.warning("[%s] audio branch failed (video unaffected): %s",
-                         self.device_id, err)
-
-    def _on_audio_sample(self, sink):
-        sample = sink.emit("pull-sample")
-        if sample:
-            buf = sample.get_buffer()
-            ok, mapinfo = buf.map(Gst.MapFlags.READ)
-            if ok:
-                with self._audio_lock:
-                    self._audio_buf += bytes(mapinfo.data)
-                    over = len(self._audio_buf) - AUDIO_MAX_BACKLOG_BYTES
-                    if over > 0:
-                        del self._audio_buf[:over]  # keep latency bounded
-                self.audio_bytes += mapinfo.size
-                self.audio_active = True
-                buf.unmap(mapinfo)
-        return Gst.FlowReturn.OK
-
-    def _audio_writer(self):
-        """Feed ffmpeg's audio pipe in real time, 20 ms at a time.
-
-        Real camera audio is used when available, silence otherwise, so
-        ffmpeg's audio input never starves (a starved input is what stalled
-        video last time). Runs in its own thread: if it blocks, only audio
-        waits -- the video callback is separate.
-        """
-        silence = bytes(AUDIO_FRAME_BYTES)
-        nxt = time.monotonic()
-        while not self._audio_stop.is_set():
-            if not self.ffmpeg_alive():
-                return  # ffmpeg gone / session stopping
-            with self._audio_lock:
-                if len(self._audio_buf) >= AUDIO_FRAME_BYTES:
-                    chunk = bytes(self._audio_buf[:AUDIO_FRAME_BYTES])
-                    del self._audio_buf[:AUDIO_FRAME_BYTES]
-                else:
-                    chunk = silence
-            # Bounded: a full pipe means ffmpeg stopped reading (its video input
-            # stalled, or it is dying). Drop the chunk; never block for good
-            # here, which is what pinned 17 writer threads before 2026-11-12.
-            with self._aud_io:
-                ok = self._write_pipe(self._audio_w, chunk, 0.5)
-            if not ok:
-                self.audio_drops += 1
-            nxt += AUDIO_FRAME_SEC
-            delay = nxt - time.monotonic()
-            if delay > 0:
-                time.sleep(delay)
-            elif delay < -0.5:
-                nxt = time.monotonic()  # fell behind; resync
-
-    def _on_sample(self, sink):
-        sample = sink.emit("pull-sample")
-        proc = self.ffmpeg
-        if sample and proc is not None and proc.stdin:
-            buf = sample.get_buffer()
-            is_delta = buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
-            if self._need_idr:
-                if is_delta:
-                    # The stream is corrupt since the last drop; a P-frame now
-                    # would reference a picture ffmpeg never got (the smear this
-                    # bridge exists to avoid). Wait for the next keyframe.
-                    self.video_drops += 1
-                    return Gst.FlowReturn.OK
-                self._need_idr = False
-            ok, mapinfo = buf.map(Gst.MapFlags.READ)
-            if ok:
-                # Bounded write: if ffmpeg is not draining the pipe the AU is
-                # dropped and the heartbeat is NOT refreshed, so the watchdog
-                # sees the session as stale and restarts it, instead of this
-                # GStreamer streaming thread blocking here for good.
-                with self._vid_io:
-                    written = self._write_pipe(proc.stdin, mapinfo.data,
-                                               PIPE_WRITE_TIMEOUT_SEC)
-                buf.unmap(mapinfo)
-                if written:
-                    self.last_sample_ts = time.time()  # heartbeat: video is flowing
-                else:
-                    self.video_drops += 1
-                    self._need_idr = True  # part of this AU may already be in the pipe
-        return Gst.FlowReturn.OK
 
 
 # --------------------------------------------------------------------------- #
@@ -1079,6 +1012,7 @@ async def handle_health(request: web.Request) -> web.Response:
             "audio_fallback": ENABLE_AUDIO and not s.audio,
             "audio_active": s.audio_active,
             "audio_bytes": s.audio_bytes,
+            "video_bytes": s.video_bytes,
             "video_drops": s.video_drops,
             "audio_drops": s.audio_drops,
         }

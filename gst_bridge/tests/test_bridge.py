@@ -1,15 +1,16 @@
 """Bridge unit tests. Run INSIDE the bridge image (GStreamer + ffmpeg present):
 
     cd gst_bridge && docker compose build && \
-    docker run --rm --init -v "$PWD/tests:/t:ro" gst_bridge-bridge \
-        python3 -I -m unittest discover -s /t -v
+    docker run --rm --init --ulimit nofile=65536:65536 -v "$PWD/tests:/t:ro" \
+        gst_bridge-bridge python3 -I -m unittest discover -s /t -v
 
 Stdlib unittest only: the image has no pytest.
 """
+import json
 import os
 import subprocess
 import sys
-import threading
+import tempfile
 import time
 import unittest
 
@@ -24,67 +25,12 @@ def mk(audio=True):
     return b.GstSession("dev", {}, "rtsp://127.0.0.1:1/x", "rtsp://127.0.0.1:1/x", audio=audio)
 
 
-class WritePipe(unittest.TestCase):
-    def test_stalled_reader_drops_within_timeout(self):
-        s = mk()
-        sleeper = subprocess.Popen(["sleep", "60"], stdin=subprocess.PIPE)
-        try:
-            os.set_blocking(sleeper.stdin.fileno(), False)
-            t0 = time.monotonic()
-            ok = s._write_pipe(sleeper.stdin, b"x" * (1 << 20), 0.5)
-            dt = time.monotonic() - t0
-            self.assertFalse(ok)
-            self.assertLess(dt, 1.5)
-            self.assertGreater(dt, 0.4)
-        finally:
-            sleeper.kill(); sleeper.wait()
-
-    def test_fd_above_1024_still_works(self):
-        """select() would raise ValueError here; poll() must not."""
-        import resource
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        hi = 1500
-        if soft <= hi:
-            if hard <= hi and hard != resource.RLIM_INFINITY:
-                self.skipTest(f"RLIMIT_NOFILE hard limit {hard} too low for fd {hi}")
-            resource.setrlimit(resource.RLIMIT_NOFILE, (hi + 100, hard))
-        r, w = os.pipe()
-        os.dup2(w, hi); os.close(w)
-        os.set_blocking(hi, False)
-        s = mk()
-
-        class F:  # minimal file-like
-            def fileno(self):
-                return hi
-        got = bytearray()
-
-        def reader():
-            while len(got) < 300_000:
-                got.extend(os.read(r, 65536))
-        t = threading.Thread(target=reader, daemon=True); t.start()
-        self.assertTrue(s._write_pipe(F(), b"y" * 300_000, 2.0))
-        t.join(2)
-        self.assertEqual(len(got), 300_000)
-        os.close(hi); os.close(r)
-
-    def test_closed_reader_is_false_immediately(self):
-        r, w = os.pipe(); os.close(r)
-        os.set_blocking(w, False)
-
-        class F:
-            def fileno(self):
-                return w
-        t0 = time.monotonic()
-        self.assertFalse(mk()._write_pipe(F(), b"z" * 10, 1.0))
-        self.assertLess(time.monotonic() - t0, 0.2)
-        os.close(w)
-
-    def test_grow_pipe(self):
-        r, w = os.pipe()
-        b._grow_pipe(w)
-        import fcntl
-        self.assertGreaterEqual(fcntl.fcntl(w, fcntl.F_GETPIPE_SZ), b.PIPE_BUFFER_BYTES)
-        os.close(r); os.close(w)
+def ffprobe_packets(path, stream):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", stream, "-show_entries",
+         "packet=pts_time", "-of", "json", path], capture_output=True, text=True, check=True).stdout
+    pts = [float(p["pts_time"]) for p in json.loads(out)["packets"] if p.get("pts_time") not in (None, "N/A")]
+    return pts
 
 
 class KillFfmpeg(unittest.TestCase):
@@ -107,26 +53,18 @@ class KillFfmpeg(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
 
-    def test_real_ffmpeg_with_full_audio_pipe_and_stop(self):
-        """Production argv, video pipe starved: the audio writer must keep
-        running (dropping) and stop() must take everything down."""
+    def test_real_ffmpeg_blocked_on_empty_stdin_and_stop(self):
+        """Production argv, nothing ever written: stop() must take it down."""
         s = mk()
-        ar, aw = os.pipe()
-        cmd = s._ffmpeg_cmd(audio_fd=ar)
+        cmd = s._ffmpeg_cmd(audio=True)
         self.assertEqual(cmd[-5:], ["-f", "rtsp", "-rtsp_transport", "tcp", s.publish_url])
         cmd = cmd[:-5] + ["-f", "null", "-"]
-        s.ffmpeg = subprocess.Popen(cmd, stdin=subprocess.PIPE, pass_fds=(ar,),
-                                    stderr=subprocess.DEVNULL)
-        os.close(ar)
-        os.set_blocking(aw, False); s._audio_w = os.fdopen(aw, "wb", buffering=0)
-        os.set_blocking(s.ffmpeg.stdin.fileno(), False)
-        th = threading.Thread(target=s._audio_writer, daemon=True); th.start()
-        time.sleep(3)
-        self.assertTrue(th.is_alive())
-        self.assertGreater(s.audio_drops, 0)
-        s.stop(); th.join(3)
+        s.ffmpeg = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        time.sleep(1.5)
+        self.assertIsNone(s.ffmpeg.poll(), "ffmpeg should be waiting on stdin")
+        t0 = time.monotonic(); s.stop(); dt = time.monotonic() - t0
         self.assertIsNone(s.ffmpeg)
-        self.assertFalse(th.is_alive())
+        self.assertLess(dt, b.FFMPEG_KILL_GRACE_SEC + 4)
 
     def test_reaper_kills_stopped_sessions_child(self):
         s = mk()
@@ -134,94 +72,88 @@ class KillFfmpeg(unittest.TestCase):
         s._stop_ts = time.time() - 100
         b._reap_stopped_sessions()
         self.assertIsNone(s.ffmpeg)
-        m = b._process_metrics()
-        self.assertEqual(m["ffmpeg_children"], 0)
+        self.assertEqual(b._process_metrics()["ffmpeg_children"], 0)
+
+    def test_grow_pipe(self):
+        import fcntl
+        r, w = os.pipe()
+        b._grow_pipe(w)
+        self.assertGreaterEqual(fcntl.fcntl(w, fcntl.F_GETPIPE_SZ), b.PIPE_BUFFER_BYTES)
+        os.close(r); os.close(w)
 
 
-class NeedIdr(unittest.TestCase):
-    """After a dropped write, delta frames are skipped until a keyframe."""
+class MediaChain(unittest.TestCase):
+    """The exact production chain (VIDEO_BRANCH + AUDIO_BRANCH + MUX_CHAIN) fed by a
+    synthetic 30 fps H.264 RTP source and a 48 kHz Opus RTP source, written to a
+    file through fdsink exactly as in production. The timestamp contract that
+    was broken before 2026-11-12 (fixed 19 fps from the SPS VUI) is asserted on
+    the Matroska output AND on ffmpeg's remux of it."""
 
-    class FakeSink:
-        def __init__(self, buf):
-            self.buf = buf
+    FPS = 30
+    SECONDS = 3
 
-        def emit(self, _):
-            class S:
-                def __init__(self, buf):
-                    self._b = buf
-
-                def get_buffer(self):
-                    return self._b
-            return S(self.buf)
-
-    def _buf(self, delta):
-        buf = Gst.Buffer.new_wrapped(b"\x00\x00\x00\x01\x65" + b"\x00" * 100)
-        if delta:
-            buf.set_flags(Gst.BufferFlags.DELTA_UNIT)
-        return buf
-
-    def test_skip_until_keyframe(self):
-        s = mk(audio=False)
-        s.ffmpeg = subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
-        os.set_blocking(s.ffmpeg.stdin.fileno(), False)
-        try:
-            s._need_idr = True
-            s._on_sample(self.FakeSink(self._buf(delta=True)))
-            self.assertEqual(s.video_drops, 1)
-            self.assertTrue(s._need_idr)
-            s._on_sample(self.FakeSink(self._buf(delta=False)))
-            self.assertFalse(s._need_idr)
-            self.assertEqual(s.video_drops, 1)
-            self.assertGreater(s.last_sample_ts, 0)
-        finally:
-            s._kill_ffmpeg()
-
-    def test_failed_write_sets_need_idr(self):
-        s = mk(audio=False)
-        s.ffmpeg = subprocess.Popen(["sleep", "60"], stdin=subprocess.PIPE)
-        os.set_blocking(s.ffmpeg.stdin.fileno(), False)
-        try:
-            os.write(s.ffmpeg.stdin.fileno(), b"\0" * 65536)  # fill the 64K pipe
-        except BlockingIOError:
-            pass
-        old = b.PIPE_WRITE_TIMEOUT_SEC; b.PIPE_WRITE_TIMEOUT_SEC = 0.2
-        try:
-            buf = Gst.Buffer.new_wrapped(b"\x00" * 200_000)
-            s._on_sample(self.FakeSink(buf))
-            self.assertTrue(s._need_idr)
-            self.assertEqual(s.video_drops, 1)
-        finally:
-            b.PIPE_WRITE_TIMEOUT_SEC = old
-            s._kill_ffmpeg()
-
-
-class VideoChain(unittest.TestCase):
-    def test_production_chain_outputs_monotonic_au(self):
-        """The exact VIDEO_CHAIN against a synthetic 30 fps RTP source: AU
-        aligned, strictly increasing PTS, ~1/30 s spacing."""
-        desc = ("videotestsrc num-buffers=60 ! video/x-raw,width=320,height=240,framerate=30/1 ! "
-                "x264enc tune=zerolatency key-int-max=30 speed-preset=ultrafast ! "
-                "rtph264pay pt=101 ! application/x-rtp,media=video,encoding-name=H264,"
-                "payload=101,clock-rate=90000 ! " + b.VIDEO_CHAIN)
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        cls.mkv = os.path.join(cls.tmp, "chain.mkv")
+        fd = os.open(cls.mkv, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        desc = (
+            f"videotestsrc num-buffers={cls.FPS * cls.SECONDS} is-live=false ! "
+            f"video/x-raw,width=320,height=240,framerate={cls.FPS}/1 ! "
+            "x264enc tune=zerolatency key-int-max=30 speed-preset=ultrafast ! "
+            "rtph264pay pt=101 config-interval=1 ! "
+            "application/x-rtp,media=video,encoding-name=H264,payload=101,clock-rate=90000 ! "
+            + b.VIDEO_BRANCH + " "
+            f"audiotestsrc num-buffers={50 * cls.SECONDS} samplesperbuffer=960 is-live=false ! "
+            "audio/x-raw,rate=48000,channels=2 ! opusenc ! rtpopuspay pt=111 ! "
+            "application/x-rtp,media=audio,encoding-name=OPUS,payload=111,clock-rate=48000 ! "
+            + b.AUDIO_BRANCH + " "
+            + b.MUX_CHAIN % fd
+        )
         pipe = Gst.parse_launch(desc)
-        sink = pipe.get_by_name("out")
-        pts = []
-
-        def on_sample(s):
-            smp = s.emit("pull-sample")
-            pts.append(smp.get_buffer().pts)
-            return Gst.FlowReturn.OK
-        sink.connect("new-sample", on_sample)
         pipe.set_state(Gst.State.PLAYING)
-        bus = pipe.get_bus()
-        msg = bus.timed_pop_filtered(15 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+        msg = pipe.get_bus().timed_pop_filtered(
+            30 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
         pipe.set_state(Gst.State.NULL)
-        self.assertIsNotNone(msg)
-        self.assertEqual(msg.type, Gst.MessageType.EOS, msg.parse_error() if msg.type == Gst.MessageType.ERROR else "")
-        self.assertGreaterEqual(len(pts), 50)
-        deltas = [b2 - a for a, b2 in zip(pts, pts[1:])]
-        self.assertTrue(all(d > 0 for d in deltas), "PTS not strictly increasing")
-        self.assertTrue(all(abs(d - Gst.SECOND / 30) < 2 * Gst.MSECOND for d in deltas), deltas[:5])
+        os.close(fd)
+        if msg is None or msg.type == Gst.MessageType.ERROR:
+            raise RuntimeError(f"pipeline failed: {msg.parse_error() if msg else 'timeout'}")
+
+    def test_mkv_has_both_tracks_with_real_timestamps(self):
+        v = ffprobe_packets(self.mkv, "v:0")
+        a = ffprobe_packets(self.mkv, "a:0")
+        self.assertGreaterEqual(len(v), self.FPS * self.SECONDS - 5, "video frames missing")
+        self.assertGreater(len(a), 100, "audio packets missing")
+        deltas = [y - x for x, y in zip(v, v[1:])]
+        self.assertTrue(all(d > 0 for d in deltas), "video PTS not strictly increasing")
+        bad = [d for d in deltas if abs(d - 1 / self.FPS) > 0.004]
+        self.assertLess(len(bad), 3, f"video PTS spacing is not 1/{self.FPS}: {bad[:5]}")
+        # A/V start within 100 ms of each other (same clock, not a paced thread).
+        self.assertLess(abs(v[0] - a[0]), 0.1, (v[0], a[0]))
+
+    def test_ffmpeg_preserves_timestamps_from_mkv(self):
+        """Production argv with the RTSP output swapped for a Matroska file."""
+        s = mk()
+        cmd = s._ffmpeg_cmd(audio=True)
+        out = os.path.join(self.tmp, "remux.mkv")
+        cmd = cmd[:-5] + ["-y", "-f", "matroska", out]
+        with open(self.mkv, "rb") as fh:
+            res = subprocess.run(cmd, stdin=fh, capture_output=True, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr.decode(errors="replace")[-500:])
+        v = ffprobe_packets(out, "v:0")
+        a = ffprobe_packets(out, "a:0")
+        self.assertGreaterEqual(len(v), self.FPS * self.SECONDS - 5)
+        self.assertGreater(len(a), 50, "AAC audio missing after remux")
+        deltas = [y - x for x, y in zip(v, v[1:])]
+        bad = [d for d in deltas if abs(d - 1 / self.FPS) > 0.004]
+        self.assertLess(len(bad), 3, f"ffmpeg did not keep 1/{self.FPS} spacing: {bad[:5]}")
+        # 3 s of input must be ~3 s of output (not 3*30/19 as with the VUI clock).
+        self.assertAlmostEqual(v[-1] - v[0], (len(v) - 1) / self.FPS, delta=0.1)
+
+    def test_build_chain_strings(self):
+        self.assertIn("fd=7", b.build_chain(7, False))
+        self.assertNotIn("rtpopusdepay", b.build_chain(7, False))
+        self.assertIn("mux.audio_0", b.build_chain(7, True))
 
 
 class LiveConfig(unittest.TestCase):

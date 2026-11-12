@@ -6,6 +6,45 @@ breaking changes between minor versions until the API surface stabilizes.
 
 ## [Unreleased]
 
+### Fixed (gst_bridge) — real timestamps end to end
+- **Video was published at a fixed 19 fps clock regardless of the camera's real
+  14-30 fps**, so Frigate recordings ran fast or slow against their audio and a
+  10 s segment held 10·fps/19 s of playback. The bridge wrote bare Annex-B
+  H.264 into ffmpeg, which can carry no timestamps; ffmpeg then stamped every
+  frame from the SPS VUI timing. The media path is now muxed in GStreamer:
+  `rtph264depay ! h264parse ! queue ! matroskamux` with the camera's Opus
+  (`rtpopusdepay ! opusparse ! queue ! matroskamux`) in the same Matroska
+  stream, written by `fdsink` straight into `ffmpeg -f matroska -i pipe:0`,
+  which copies the video, decodes/boosts/AAC-encodes the audio and publishes
+  RTSP. Both tracks carry the jitterbuffer's PTS, so A/V stay in sync and
+  ffmpeg's interleaver no longer holds a stream back. Measured on the published
+  stream: reading 15 PTS-seconds takes 15 wall-seconds (was ~12), PTS spacing
+  follows the real frame rate (33 ms at ~28 fps).
+- Removed with it: the second (PCM) pipe, the Python audio writer and silence
+  pacer, the bounded `_write_pipe`, the IDR-wait after a drop (`fdsink` writes
+  whole clusters; stalls are isolated by per-track `queue leaky=downstream`
+  and surface as `video_drops`/`audio_drops` via the queues' `overrun`), and
+  `PIPE_WRITE_TIMEOUT_SEC`. New knob `PAD_SETTLE_MS` (1500): how long the muxer
+  waits for the audio pad before publishing video-only. The heartbeat is a
+  probe on `fdsink`'s sink pad (what ffmpeg actually receives).
+- Every webrtcbin src pad is linked inside its own pad-added handler, because
+  the first RTP buffer follows pad-added by ~1 ms and a push on an unlinked
+  pad is a fatal not-linked error for the source; audio and video pad-added
+  arrive on different threads, so the handler is serialised. The muxer's
+  audio request pad is created up front and released on the settle timeout
+  if the track never arrives (`-map 0:a?` keeps ffmpeg happy without audio).
+- `aresample=async=1` on the audio filter: the camera's Opus RTP clock jumps
+  backwards by ~100 ms now and then, which showed up as "Non-monotonous DTS"
+  on the AAC output once the real timestamps were carried through.
+- Teardown clears the chain and pad references too (fd count after a
+  reconnect is identical to a fresh start again).
+- Tests: `MediaChain` runs the exact production chain against synthetic 30 fps
+  H.264 + Opus RTP sources into a file via fdsink and asserts 1/30 s PTS
+  spacing and A/V alignment on the Matroska output and on ffmpeg's remux of it
+  (this would have caught the 19 fps clock). Also caught during development:
+  `-fflags +nobuffer` makes ffmpeg's Matroska demuxer drop a third of the
+  frames, and `Gst.Iterator` is not Python-iterable in PyGObject 3.42.
+
 ### Added
 - `binary_sensor.<camera>_bridge_stream` (connectivity, diagnostic): ON while the
   camera bridge is reachable and this camera's live session has video flowing.

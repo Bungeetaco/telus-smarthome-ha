@@ -227,6 +227,11 @@ loopback-only.
 - The bridge logs `answer rtcp-fb: ... nack, nack pli` once per session: that is
   the camera agreeing to retransmit lost packets. If `nack` disappears, loss
   recovery is off and recordings will smear again.
+- Timestamps: `ffprobe -rtsp_transport tcp -show_entries packet=pts_time
+  -read_intervals '%+15' rtsp://127.0.0.1:8556/telus_<id>` should take about 15
+  wall-clock seconds and show PTS spacing equal to the camera's real frame
+  interval (the bridge muxes the jitterbuffer's PTS into Matroska for ffmpeg;
+  a raw H.264 pipe would make ffmpeg invent a fixed-rate clock).
 - `docker kill -s USR1 gst_bridge-bridge-1` dumps every thread's stack into the
   container log when something hangs.
 - Docker marks the container unhealthy on HTTP 503 but never restarts it on its
@@ -239,8 +244,8 @@ loopback-only.
 | `WEBRTC_NACK` | `1` | Negotiate RTCP NACK on the video transceiver so lost RTP packets are retransmitted (the camera supports `nack` and `nack pli`). `0` disables. |
 | `WEBRTC_JITTER_MS` | `300` | webrtcbin jitterbuffer depth; must cover one retransmission round trip for NACK to help. |
 | `FFMPEG_KILL_GRACE_SEC` | `3` | After closing ffmpeg's pipes and sending SIGTERM, wait this long before SIGKILL. |
-| `PIPE_WRITE_TIMEOUT_SEC` | `0.5` | A video write into ffmpeg that does not finish within this time is dropped (ffmpeg stopped reading) instead of blocking the pipeline; delta frames are then skipped until the next keyframe. |
-| `PIPE_BUFFER_BYTES` | `1048576` | Pipe capacity requested with `F_SETPIPE_SZ` so one keyframe is a single write. |
+| `PAD_SETTLE_MS` | `1500` | How long the Matroska muxer waits for the camera's audio pad after the first pad before publishing video-only. |
+| `PIPE_BUFFER_BYTES` | `1048576` | Capacity of ffmpeg's stdin pipe (`F_SETPIPE_SZ`) so `fdsink` hands a whole cluster over in one write. |
 | `BRIDGE_HOST` | `0.0.0.0` | Bind address of the control API. Use `127.0.0.1` when Home Assistant runs on the same host. |
 | `MAX_SESSIONS` | `8` | Concurrent sessions accepted before `/start` answers 429. |
 | `STREAM_STALE_SEC` / `STARTUP_GRACE_SEC` / `MAX_AUTO_RECONNECTS` / `STOP_TIMEOUT_SEC` | `8` / `25` / `6` / `5` | Self-healing watchdog (see comments in `telus_gst_bridge.py`). |
